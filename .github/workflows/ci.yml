@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (${{ matrix.name }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows PowerShell 5.1
+            exe: powershell.exe
+          - name: PowerShell 7
+            exe: pwsh.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate manifest
+        shell: pwsh
+        run: |
+          & ${{ matrix.exe }} -NoProfile -Command { $ErrorActionPreference = 'Stop'; Test-ModuleManifest ./TerminalRess/TerminalRess.psd1 | Format-List Name, Version, Author }
+          exit $LASTEXITCODE
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          & ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -File ./tests/Run-Tests.ps1
+          exit $LASTEXITCODE
+
+  analyze:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+
+      - name: Analyze (errors fail the build)
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path ./TerminalRess -Recurse -Severity Error, Warning
+          $results | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message | Out-String -Width 300
+          $errors = @($results | Where-Object Severity -eq 'Error')
+          if ($errors.Count -gt 0) { throw "$($errors.Count) PSScriptAnalyzer error(s)" }
