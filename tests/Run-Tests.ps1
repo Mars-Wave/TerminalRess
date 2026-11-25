@@ -4,7 +4,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $modDir = Join-Path $root 'TerminalRess'
-foreach ($n in 'CLAUDECODE') { [Environment]::SetEnvironmentVariable($n, $null, 'Process') }
+foreach ($n in 'CLAUDECODE', 'WT_SESSION', 'TERMINALRESS_TAB') { [Environment]::SetEnvironmentVariable($n, $null, 'Process') }
 
 $work = Join-Path $env:LOCALAPPDATA ('Temp\TerminalRessTests\' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -181,6 +181,7 @@ function prompt { `$global:seen = "ok=`$? lec=`$global:LASTEXITCODE"; 'ORIG> ' }
 . '$hook'
 Set-Location '$acc'
 `$env:MY_VAR = 'hola $([char]0xf1)'
+`$env:MY_ESC = 'q"b\c' + [char]9 + 'd'
 Get-Item C:\definitely-missing -ErrorAction SilentlyContinue
 `$r = prompt
 "PROMPT=[`$r] SEEN=[`$global:seen]"
@@ -198,6 +199,7 @@ Get-Item C:\definitely-missing -ErrorAction SilentlyContinue
     Assert ($tab.cwd -eq $acc) 'state file: cwd (accented path)'
     Assert ($tab.envDiff.VSCMD_TEST -eq 'from-profile') 'env diff includes vars set by the PROFILE (baseline is pre-profile)'
     Assert ($tab.envDiff.MY_VAR -eq "hola $([char]0xf1)") 'env diff includes a var set later (accent intact)'
+    Assert ($tab.envDiff.MY_ESC -ceq ('q"b\c' + [char]9 + 'd')) 'quotes, backslashes and control characters survive the JSON round trip'
     Assert ($tab.envDiff.Path -like '*;C:\added') 'env diff includes PATH change'
     Assert (-not $tab.envDiff.PSObject.Properties['NO_COLOR'] -and -not $tab.envDiff.PSObject.Properties['WT_SESSION']) 'denylisted vars (NO_COLOR, WT_*) excluded'
     Assert ($tab.pendingCommand -eq 'ping -t 127.0.0.1') 'pendingCommand recorded at accept time'
@@ -205,14 +207,28 @@ Get-Item C:\definitely-missing -ErrorAction SilentlyContinue
     Assert ($tab.shellExe -like '*powershell.exe' -and $tab.shellStart -gt 0) 'shell exe + start time recorded'
     Assert ((Get-Content (Join-Path $state 'dryrun.log') -Raw) -match 'guardian\.ps1') 'hook ensures the guardian is started'
     Assert (-not (Get-ChildItem (Join-Path $state 'live') -Filter *.tmp)) 'atomic write leaves no tmp files'
+    Assert (-not $tab.PSObject.Properties['wtPid']) 'the hook leaves the owning WT to the guardian'
+    $out = Invoke-ChildShell "`$env:WT_SESSION = 'light'; . '$hook'; 'LOADED=' + [bool]`$global:__TR + ' COMMON=' + [bool](Get-Command Get-TROwnerWt -ErrorAction SilentlyContinue) + ' CIM=' + [bool](Get-Module CimCmdlets) + ' UTILITY=' + [bool](Get-Module Microsoft.PowerShell.Utility)"
+    Assert ($out -match 'LOADED=True COMMON=False CIM=False UTILITY=False') "hook loads only Base.ps1: no CIM, no Utility module (JSON cmdlets, New-Object): $($out.Trim())"
 
     Section 'hook: not active in tool shells'
     Reset-State
     $out = Invoke-ChildShell "`$env:WT_SESSION='x'; `$env:CLAUDECODE='1'; . '$hook'; 'LOADED=' + [bool]`$global:__TR"
     Assert ($out -match 'LOADED=False') 'CLAUDECODE set -> inactive'
     $env:TERMINALRESS_FORCE = $null
-    $out = Invoke-ChildShell "`$env:WT_SESSION='x'; . '$hook'; 'LOADED=' + [bool]`$global:__TR"
-    Assert ($out -match 'LOADED=False') 'parent is not OpenConsole/WindowsTerminal -> inactive'
+    $nested = Join-Path $work 'nested.ps1'
+    [IO.File]::WriteAllText($nested, "param(`$S) if (`$S) { `$env:WT_SESSION = `$S }; . '$hook'; 'NESTED=' + [bool]`$global:__TR", (New-Object Text.UTF8Encoding $true))
+    $out = Invoke-ChildShell @"
+`$env:WT_SESSION = 'outer'
+. '$hook'
+'OUTER=' + [bool]`$global:__TR + ' MARK=' + `$env:TERMINALRESS_TAB
+& '$psExe' -NoProfile -ExecutionPolicy Bypass -File '$nested'
+& '$psExe' -NoProfile -ExecutionPolicy Bypass -File '$nested' 'new-tab-session'
+"@
+    Assert ($out -match 'OUTER=True MARK=outer') 'a tracked shell marks its environment with its WT_SESSION'
+    Assert (([regex]::Matches($out, 'NESTED=False')).Count -eq 1) 'a shell started inside a tracked tab (same WT_SESSION) -> inactive'
+    Assert (([regex]::Matches($out, 'NESTED=True')).Count -eq 1) 'a new tab opened from a tracked shell (own WT_SESSION, inherited marker) -> tracked'
+    Assert ('TERMINALRESS_TAB' -match (& $mod { $TR_ScrubRegex })) 'the marker is scrubbed from every process TerminalRess launches (restored tabs, guardian)'
     $out = Invoke-ChildShell ". '$hook'; 'LOADED=' + [bool]`$global:__TR"
     Assert ($out -match 'LOADED=False') 'no WT_SESSION -> inactive'
     $env:TERMINALRESS_FORCE = '1'
@@ -319,6 +335,59 @@ elseif (`$Mode -eq 'claude') {
             Assert (@(Register-TerminalRessExisting).Count -eq 0) 'seeding twice adds nothing'
         }
     } else { Write-Host '  skip (no WindowsTerminal running): seeding' -ForegroundColor Yellow }
+    Section 'owner sidecar (guardian) + config fast path'
+    Reset-State; & $mod { Initialize-TRDirs }
+    $t0 = [datetime]'2026-01-01T10:00:00'
+    $mkProc = { param($id, $ppid, $name, $sec) [pscustomobject]@{ ProcessId = [uint32]$id; ParentProcessId = [uint32]$ppid; Name = $name; CreationDate = $t0.AddSeconds($sec) } }
+    $byId = @{}
+    foreach ($p in @((& $mkProc 10 1 'WindowsTerminal.exe' 0), (& $mkProc 11 10 'OpenConsole.exe' 5), (& $mkProc 12 11 'powershell.exe' 6), (& $mkProc 13 10 'pwsh.exe' 7),
+                     (& $mkProc 14 12 'powershell.exe' 8), (& $mkProc 20 1 'WindowsTerminal.exe' 50), (& $mkProc 21 20 'OpenConsole.exe' 51), (& $mkProc 15 21 'pwsh.exe' 9))) { $byId[$p.ProcessId] = $p }
+    $own = & $mod { param($m) @(12, 13, 14, 15 | ForEach-Object { $w = Find-TROwnerInSnapshot $_ $m; if ($w) { $w.ProcessId } else { '-' } }) -join ',' } $byId
+    Assert ($own -eq '10,10,-,-') "owner walk: via OpenConsole, direct, nested shell = none, reused parent PIDs = none: $own"
+    $live = Join-Path $state 'live'
+    New-FakeTab 12 $t0.AddSeconds(6).Ticks 'C:\' $null 'x' $null $live
+    New-FakeTab 14 $t0.AddSeconds(8).Ticks 'C:\' $null 'x' $null $live
+    & $mod { param($m) foreach ($n in 12, 14) { $f = Join-Path $script:TR_Live "$n.json"; Set-TRTabOwner $f (Read-TRTab $f) $m } } $byId
+    Assert ((Test-Path (Join-Path $live '12.owner.json')) -and -not (Test-Path (Join-Path $live '14.owner.json'))) 'guardian writes the owner sidecar only when it finds the WT'
+    $rt12 = & $mod { Read-TRTab (Join-Path $script:TR_Live '12.json') }
+    Assert ($rt12.wtPid -eq 10 -and $rt12.wtStart -eq $t0.Ticks -and $rt12.cwd -eq 'C:\') 'Read-TRTab merges the owner into the tab'
+    Assert (@(& $mod { Get-TRTabFiles $script:TR_Live }).Count -eq 2) 'sidecars are not tab files'
+    New-FakeTab 12 $t0.AddSeconds(99).Ticks 'C:\' $null 'x' $null $live
+    Assert ($null -eq (& $mod { Read-TRTab (Join-Path $script:TR_Live '12.json') }).wtPid) 'a stale owner (PID reused by a newer shell) is ignored'
+    & $mod { Move-TRTabFiles (Join-Path $script:TR_Live '12.json') $script:TR_Last; Remove-TRTabFiles (Join-Path $script:TR_Live '14.json') }
+    Assert ((Test-Path (Join-Path $state 'last\12.owner.json')) -and @(Get-ChildItem $live).Count -eq 0) 'the owner sidecar moves and is deleted with its tab'
+    $me = Get-Process -Id $PID
+    $mkOwner = { param($n, $start, $wpid, $wstart) & $mod { param($n, $o) Write-TRJson (Join-Path $script:TR_Live "$n.owner.json") $o } $n ([ordered]@{ shellPid = $n; shellStart = $start; wtPid = $wpid; wtStart = $wstart }) }
+    New-FakeTab 99971 $t0.Ticks 'C:\' $null 'x' $null $live; & $mkOwner 99971 $t0.Ticks 99999999 $t0.Ticks
+    $now = [datetime]::Now.Ticks
+    New-FakeTab 99972 $now 'C:\' $null 'x' $null $live; & $mkOwner 99972 $now $PID $me.StartTime.Ticks
+    & $mod { Invoke-TRSweep }
+    Assert ((Test-Path (Join-Path $state 'last\99971.json')) -and (Test-Path (Join-Path $state 'last\99971.owner.json'))) 'sweep: dead shell whose sidecar owner is gone -> moved to last with its sidecar'
+    Assert ((Test-Path (Join-Path $live '99972.json')) -and -not (Test-Path (Join-Path $state 'last\99972.json'))) 'sweep: dead shell whose sidecar owner is alive -> left for the guardian'
+    $r = & $mod { $f = Get-Item (Join-Path $script:TR_Live '99972.json'); Resolve-TRDeadTab $f (Read-TRTab $f.FullName) }
+    Assert ($r -eq 'deleted' -and @(Get-ChildItem $live).Count -eq 0) 'dead shell whose sidecar owner is alive -> closed, tab and sidecar deleted'
+    foreach ($n in '99973.owner.json', '99974.run.json', '99971.run.json') { [IO.File]::WriteAllText((Join-Path $live $n), '{}') }
+    & $psExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $modDir 'Runtime\guardian.ps1') -Once | Out-Null
+    $left = @(Get-ChildItem $live -Name) -join ','
+    Assert ($left -eq '99971.run.json') "guardian prunes orphan sidecars, keeps one whose tab is in last\ (mid-move): $left"
+    Remove-Item (Join-Path $live '99971.run.json')
+    $envOut = Join-Path $work 'scrub.txt'
+    & $mod { param($o) $env:TERMINALRESS_TAB = 'scrub-test'; $env:TERMINALRESS_DRYRUN = $null
+        try { Start-TRProcess (Join-Path $env:SystemRoot 'System32\cmd.exe') "/c set > `"$o`"" -Hidden } finally { $env:TERMINALRESS_TAB = $null; $env:TERMINALRESS_DRYRUN = '1' } } $envOut
+    $deadline = (Get-Date).AddSeconds(10)
+    while (-not ((Test-Path $envOut) -and (Get-Content $envOut -Raw) -match 'TERMINALRESS_STATE=') -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+    $envTxt = Get-Content $envOut -Raw
+    Assert ($envTxt -match '(?m)^TERMINALRESS_STATE=' -and $envTxt -notmatch '(?m)^TERMINALRESS_TAB=') 'Start-TRProcess removes TERMINALRESS_TAB from the child environment'
+    $dl = & $mod { (Get-TREnvDenylist) -join '|' }
+    Assert ($dl -eq ((& $mod { Get-TRDefaultConfig }).envDenylist -join '|')) 'denylist fast path: no config.json -> defaults'
+    foreach ($c in @('{ "graceSeconds": 1, "envDenylist" : [ "A*", "B]" ,"c d" ] }', '{"envDenylist":[]}', '{"envDenylist":["x\\y","Q"]}', '{"envDenylist":null}', '{"graceSeconds":2}')) {
+        [IO.File]::WriteAllText((Join-Path $state 'config.json'), $c)
+        $fast = & $mod { $script:TR_ConfigCache = $null; (Get-TREnvDenylist) -join '|' }
+        $full = & $mod { (Get-TRConfig -Fresh).envDenylist -join '|' }
+        Assert ($fast -ceq $full) "denylist fast path = Get-TRConfig for $c -> [$fast]"
+    }
+    Remove-Item (Join-Path $state 'config.json'); & $mod { $script:TR_ConfigCache = $null }
+
     Section 'restore-tab: baseline -> env -> RESTORING profile -> cwd -> command'
     Reset-State; & $mod { Initialize-TRDirs }
     $fprof = Join-Path $work 'fakeprofile.ps1'
@@ -395,7 +464,7 @@ elseif (`$Mode -eq 'claude') {
     Assert (& $mod { Update-TRRuntime $TR_ModuleRoot }) 'unstamped (pre-version.txt) runtime is updated'
     '0.9.0' | Set-Content (Join-Path $rt 'version.txt'); 'old' | Set-Content (Join-Path $rt 'tab-hook.ps1')
     Assert (& $mod { Update-TRRuntime $TR_ModuleRoot }) 'older runtime: updated'
-    Assert ([IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook -and (Test-Path (Join-Path $rt 'guardian.ps1'))) 'runtime files replaced by the module copy'
+    Assert ([IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook -and (Test-Path (Join-Path $rt 'guardian.ps1')) -and (Test-Path (Join-Path $rt 'Base.ps1'))) 'runtime files replaced by the module copy (new files added)'
     Assert ((Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq '1.0.0' -and (Get-TerminalRessStatus).RuntimeVersion -eq [version]'1.0.0') 'runtime stamped with the module version (status shows it)'
     Assert (@(Get-ChildItem $rt -Filter '*.tmp').Count -eq 0) 'no staging files left behind'
     foreach ($v in '1.0.0', '2.0.0') {
@@ -410,7 +479,7 @@ elseif (`$Mode -eq 'claude') {
         New-Item -ItemType Directory -Force -Path $d | Out-Null
         "@{ ModuleVersion = '$($x[2])' }" | Set-Content (Join-Path $d 'TerminalRess.psd1')
         New-Item -ItemType Directory -Force -Path (Join-Path $d 'Runtime') | Out-Null
-        foreach ($f in @(if ($x[3]) { 'Common.ps1', 'tab-hook.ps1', 'guardian.ps1' } else { 'Common.ps1' })) { '' | Set-Content (Join-Path $d "Runtime\$f") }
+        foreach ($f in @(if ($x[3]) { 'Base.ps1', 'Common.ps1', 'tab-hook.ps1', 'guardian.ps1' } else { 'Base.ps1', 'Common.ps1' })) { '' | Set-Content (Join-Path $d "Runtime\$f") }
     }
     $best = & $mod { param($r) Find-TRNewestModule $r } @((Join-Path $roots 'a'), (Join-Path $roots 'b'), (Join-Path $roots 'c'), (Join-Path $roots 'none'))
     Assert ($best -eq (Join-Path $roots 'b\TerminalRess\1.2.0')) "newest complete module across roots (versioned + flat layouts, half-copied one skipped): $best"

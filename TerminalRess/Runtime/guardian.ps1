@@ -1,5 +1,6 @@
 # TerminalRess guardian: single hidden instance per state dir. Every ~3 s it records each tab's foreground child
-# (live\<pid>.run.json) and, when a tab shell dies, decides whether the user closed the tab or Windows Terminal ended.
+# (live\<pid>.run.json) and owning Windows Terminal (live\<pid>.owner.json) and, when a tab shell dies, decides
+# whether the user closed the tab or Windows Terminal ended.
 param([int]$IntervalSec = 3, [switch]$Once)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Common.ps1')
@@ -41,11 +42,20 @@ function Sync-Runtime {
 }
 
 function Invoke-Tick {
-    $files = @(Get-TRTabFiles $TR_Live)
+    $all = @(if (Test-Path -LiteralPath $TR_Live) { Get-ChildItem -LiteralPath $TR_Live -Filter '*.json' -File })
+    $files = @($all | Where-Object { $_.Name -notlike '*.*.json' })
+    # a sidecar written just as its tab was moved or deleted elsewhere would linger; a tab still in last\ is mid-move
+    $tabNames = @{}; foreach ($f in $files) { $tabNames[$f.Name] = 1 }
+    foreach ($s in $all) {
+        $tabName = $s.Name -replace '\..*$', '.json'
+        if (-not $tabNames.ContainsKey($tabName) -and -not (Test-Path -LiteralPath (Join-Path $TR_Last $tabName))) {
+            Remove-Item -LiteralPath $s.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
     if ($files.Count -eq 0) { return }
     $snap = $null; $byId = @{}
     foreach ($f in $files) {
-        $tab = Read-TRJson $f.FullName
+        $tab = Read-TRTab $f.FullName
         if (-not $tab) { continue }
         if (-not $snap) {          # one CIM query per loop, only when there is something to look at
             $snap = Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate
@@ -55,6 +65,7 @@ function Invoke-Tick {
         if (Test-TRShellAlive $tab $byId) {
             $deadSince.Remove($spid)
             if ((Get-TRTabSession $tab) -ne $mySession) { continue }
+            try { Set-TRTabOwner $f.FullName $tab $byId } catch { Write-TRLog "owner write $spid failed: $($_.Exception.Message)" }   # must not starve the rest of the tick
             $shell = $byId[[uint32]$spid]
             $kids = @($snap | Where-Object { $_.ParentProcessId -eq $spid -and $_.Name -notin $ignoreNames -and $_.CreationDate -ge $shell.CreationDate -and $_.CommandLine -notlike '*guardian.ps1*' })   # the guardian itself is spawned by the first tab: not a foreground program
             $runPath = Get-TRRunPath $f.FullName

@@ -1,36 +1,35 @@
 # TerminalRess main hook. Dot-sourced at the END of the profile so it wraps the final prompt.
 # Registers this shell (a Windows Terminal tab) in <state>\live\<pid>.json on every prompt.
-# Test switches: TERMINALRESS_STATE (state dir), TERMINALRESS_FORCE=1 (skip parent check), TERMINALRESS_DRYRUN=1.
+# Runs in every new tab, so it loads only Base.ps1 and never touches CIM: the guardian records the owning WT.
+# Test switches: TERMINALRESS_STATE (state dir), TERMINALRESS_FORCE=1 (skip the nested-shell check), TERMINALRESS_DRYRUN=1.
 
 if (-not $env:WT_SESSION) { return }
 if ($env:CLAUDECODE) { return }
 if ($global:__TR) { return }
+# A shell started inside a tracked tab inherits that tab's WT_SESSION and the marker set below; a new tab (even one
+# opened by wt.exe from a tracked shell) gets a WT_SESSION of its own.
+if ($env:TERMINALRESS_FORCE -ne '1' -and $env:TERMINALRESS_TAB -eq $env:WT_SESSION) { return }
 
 try {
-    . (Join-Path $PSScriptRoot 'Common.ps1')
-    # guard + owning WT (shell -> OpenConsole -> WindowsTerminal)
-    $trOwner = Get-TROwnerWt $PID
-    if ($env:TERMINALRESS_FORCE -ne '1' -and $trOwner.ParentName -notin 'OpenConsole', 'WindowsTerminal') { return }
-    Initialize-TRDirs
-    $trCfg = Get-TRConfig
+    . (Join-Path $PSScriptRoot 'Base.ps1')
+    $null = [IO.Directory]::CreateDirectory($script:TR_Live)
 
     # Baseline = the environment the shell process STARTED with (captured by the pre-hook at the top of the profile),
     # so changes made by the profile itself are part of the diff. Fallback: now.
-    $trBase = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    $trBase = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
     $trSrc = if ($global:TerminalRessBaseline) { $global:TerminalRessBaseline } else { [Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Process) }
-    foreach ($e in $trSrc.GetEnumerator()) { $trBase[[string]$e.Key] = [string]$e.Value }
+    foreach ($trE in $trSrc.GetEnumerator()) { $trBase[[string]$trE.Key] = [string]$trE.Value }
     if (-not $global:TerminalRessBaseline) { $global:TerminalRessBaseline = $trSrc }
 
     $me = [Diagnostics.Process]::GetCurrentProcess()
     $global:__TR = @{
         File        = Join-Path $script:TR_Live "$PID.json"
         Baseline    = $trBase
-        Deny        = ConvertTo-TRWildcardRegex @($trCfg.envDenylist)
+        Deny        = ConvertTo-TRWildcardRegex (Get-TREnvDenylist)
         Utf8        = $script:TR_Utf8
         ShellStart  = $me.StartTime.Ticks
         ShellExe    = $me.Path
         Session     = $me.SessionId
-        Owner       = $trOwner
         Exiting     = $false
         PromptCount = 0
         PromptAt    = [DateTime]::UtcNow
@@ -42,20 +41,33 @@ try {
         OrigHandler = $null
         Sensitive   = '(?i)password|asplaintext|token|apikey|api_key|secret|credential'
     }
+    $env:TERMINALRESS_TAB = $env:WT_SESSION
 } catch { return }
+
+# Hand-written JSON: on Windows PowerShell the first ConvertTo-Json in a shell costs ~40 ms (module + assembly load).
+# Only strings, integers, booleans, null and string maps occur here.
+function global:TR_Json($v) {
+    if ($null -eq $v) { return 'null' }
+    if ($v -is [bool]) { if ($v) { return 'true' } else { return 'false' } }
+    if ($v -is [int] -or $v -is [long]) { return [string]$v }
+    if ($v -is [Collections.IDictionary]) { return '{' + (@(foreach ($k in $v.Keys) { (TR_Json ([string]$k)) + ':' + (TR_Json $v[$k]) }) -join ',') + '}' }
+    $s = ([string]$v).Replace('\', '\\').Replace('"', '\"')
+    if ($s -match '[\x00-\x1f]') { $s = [regex]::Replace($s, '[\x00-\x1f]', { '\u{0:x4}' -f [int][char]$args[0].Value }) }
+    '"' + $s + '"'
+}
 
 function global:TR_WriteState {
     try {
         $t = $global:__TR
         $o = [ordered]@{
             shellPid = $PID; shellStart = $t.ShellStart; shellExe = $t.ShellExe; session = $t.Session; wtSession = $env:WT_SESSION
-            wtPid = $t.Owner.Pid; wtStart = $t.Owner.Start; exiting = $t.Exiting
+            exiting = $t.Exiting
             cwd = $t.Cwd; envDiff = $t.EnvDiff; lastCommand = $t.LastCommand; pendingCommand = $t.Pending
             updatedAt = [DateTime]::UtcNow.ToString('o')
         }
         $tmp = "$($t.File).tmp"
-        [IO.File]::WriteAllText($tmp, ($o | ConvertTo-Json -Depth 4 -Compress), $t.Utf8)
-        Move-Item -LiteralPath $tmp -Destination $t.File -Force
+        [IO.File]::WriteAllText($tmp, (TR_Json $o), $t.Utf8)
+        if ([IO.File]::Exists($t.File)) { [IO.File]::Replace($tmp, $t.File, [NullString]::Value) } else { [IO.File]::Move($tmp, $t.File) }
     } catch { }
 }
 
@@ -106,8 +118,10 @@ function global:prompt {
 
 # Record the accepted line (typed form) as pendingCommand, chaining any existing handler.
 try {
-    $global:__TR.OrigHandler = (Get-PSReadLineOption).AddToHistoryHandler
-    Set-PSReadLineOption -AddToHistoryHandler {
+    # the live options object, as Set-PSReadLineOption sets it; the static call skips the cmdlets' first-call cost
+    $trOpt = try { [Microsoft.PowerShell.PSConsoleReadLine]::GetOptions() } catch { Get-PSReadLineOption }
+    $global:__TR.OrigHandler = $trOpt.AddToHistoryHandler
+    $trOpt.AddToHistoryHandler = {
         param([string]$line)
         try {
             $t = $global:__TR
@@ -133,4 +147,5 @@ try {
     $null = Start-TRGuardianProcess
 } catch { }
 
-Remove-Variable trCfg, trBase, trSrc, trOwner, me -ErrorAction SilentlyContinue
+# not Remove-Variable: its module would be loaded just for this
+foreach ($trV in 'trBase', 'trSrc', 'trOpt', 'me', 'trE', 'trV') { $ExecutionContext.SessionState.PSVariable.Remove($trV) }

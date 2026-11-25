@@ -1,60 +1,11 @@
-# TerminalRess shared library.
-# Dot-sourced by the module, by the hook (inside a user's profile), by the guardian,
-# by restore-tab and by startup.ps1. Keep it dependency free and Windows PowerShell 5.1 compatible.
+# TerminalRess shared library: Base.ps1 plus everything the restore paths, the guardian and the module need.
+# Dot-sourced by the module, by the guardian, by pre-adopt/restore-tab and by startup.ps1 (the tab hook loads only Base.ps1).
+# Keep it dependency free and Windows PowerShell 5.1 compatible.
 # ASCII only: PowerShell 5.1 reads BOM-less files as ANSI.
 
-$script:TR_Runtime = $PSScriptRoot
-$script:TR_State   = if ($env:TERMINALRESS_STATE) { $env:TERMINALRESS_STATE } else { Join-Path $env:LOCALAPPDATA 'TerminalRess' }
-$script:TR_Live    = Join-Path $script:TR_State 'live'
-$script:TR_Last    = Join-Path $script:TR_State 'last'
-$script:TR_Archive = Join-Path $script:TR_State 'archive'
-$script:TR_Utf8    = New-Object Text.UTF8Encoding $false
-$script:TR_InstalledRuntime = if ($env:TERMINALRESS_RUNTIME) { $env:TERMINALRESS_RUNTIME } else { Join-Path $env:LOCALAPPDATA 'TerminalRess\runtime' }
-$script:TR_ScrubRegex = '^(CLAUDE|NO_COLOR$|GIT_TERMINAL_PROMPT$|WT_SESSION$|WT_PROFILE_ID$|POSH_|TERMINALRESS_RESTORING$|TERMINALRESS_FORCE$)'
-$script:TR_ConfigCache = $null
-
-# ---------------------------------------------------------------- config
-function Get-TRDefaultConfig {
-    [ordered]@{
-        envDenylist     = @('WT_*', 'POSH_*', 'CLAUDE*', 'CLAUDECODE', 'NO_COLOR', 'GIT_TERMINAL_PROMPT', 'TERMINALRESS_*',
-                            'PSModulePath', '_', 'PROMPT', 'PWD', 'OLDPWD', 'COLUMNS', 'LINES', 'TERM_*', 'SESSIONNAME',
-                            'PSExecutionPolicyPreference', '__*')
-        # Programs that are re-executed on restore (matched on the guardian's child exe name, not the typed text).
-        # Everything else that was running is only PRE-TYPED. Resume handlers (claude, ...) always resume.
-        replayAllowlist = @('nvim', 'vim', 'vi', 'nano', 'less', 'more', 'man', 'ssh', 'htop', 'btop', 'top', 'lazygit')
-        restoreOnLaunch = $true
-        restoreOnLogon  = $true
-        graceSeconds    = 5
-        wtPath          = $null
-        resumeHandlers  = @()
-        # Strings appended to every restored tab's shell command line (as a trailing comment, so the profile sees them in
-        # [Environment]::GetCommandLineArgs()), e.g. @('--skip-vcvars').
-        profileArgs     = @()
-        # Environment variables set BEFORE the profile runs in every restored tab and removed afterwards (unless the saved
-        # tab has that variable in its environment, which then wins and stays), e.g. @{ PROFILE_VCVARS = 'skip' }.
-        profileEnv      = @{}
-    }
-}
-function Get-TRConfig {
-    param([switch]$Fresh)
-    if ($script:TR_ConfigCache -and -not $Fresh) { return $script:TR_ConfigCache }
-    $cfg = Get-TRDefaultConfig
-    $p = Join-Path $script:TR_State 'config.json'
-    if (Test-Path -LiteralPath $p) {
-        $u = Read-TRJson $p
-        if ($u) { foreach ($k in @($cfg.Keys)) { if ($u.PSObject.Properties[$k] -and $null -ne $u.$k) { $cfg[$k] = $u.$k } } }
-    }
-    $script:TR_ConfigCache = [pscustomobject]$cfg
-    $script:TR_ConfigCache
-}
-function ConvertTo-TRWildcardRegex([string[]]$Patterns) {
-    $alts = foreach ($p in $Patterns) { if ($p) { ([regex]::Escape($p)).Replace('\*', '.*').Replace('\?', '.') } }
-    New-Object Text.RegularExpressions.Regex ('^(?:' + ($alts -join '|') + ')$'), 'IgnoreCase'
-}
+. (Join-Path $PSScriptRoot 'Base.ps1')
 
 # ---------------------------------------------------------------- io
-function Initialize-TRDirs { foreach ($d in $script:TR_State, $script:TR_Live, $script:TR_Last, $script:TR_Archive) { if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null } } }
-function Read-TRJson([string]$Path) { try { [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch { $null } }
 function Write-TRJson([string]$Path, $Obj) {
     $tmp = "$Path.$PID.tmp"
     [IO.File]::WriteAllText($tmp, ($Obj | ConvertTo-Json -Depth 6 -Compress), $script:TR_Utf8)
@@ -68,19 +19,7 @@ function Write-TRLog([string]$Message) {
         [IO.File]::AppendAllText($log, ("{0:s} {1}`r`n" -f (Get-Date), $Message), $script:TR_Utf8)
     } catch { }
 }
-function Get-TRHash([string]$s, [switch]$Md5) {
-    # MD5 throws under the Windows FIPS policy (so does SHA256Managed on .NET Framework < 4.8); the CSP class is FIPS-validated.
-    # -Md5 only rebuilds the pre-SHA256 mutex names.
-    if ($Md5) { $h = [Security.Cryptography.MD5]::Create() }
-    else { $h = try { New-Object Security.Cryptography.SHA256CryptoServiceProvider } catch { [Security.Cryptography.SHA256]::Create() } }
-    try { (($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($s.ToLowerInvariant())) | Select-Object -First 4 | ForEach-Object { $_.ToString('x2') }) -join '') }
-    finally { $h.Dispose() }
-}
-function Get-TRMutexName([string]$Kind, [switch]$Legacy) { "Local\TerminalRess-$Kind-" + (Get-TRHash $script:TR_State -Md5:$Legacy) }
 function Get-TRSessionId { [Diagnostics.Process]::GetCurrentProcess().SessionId }
-function Get-TRRuntimeDir {
-    if (Test-Path -LiteralPath (Join-Path $script:TR_InstalledRuntime 'guardian.ps1')) { $script:TR_InstalledRuntime } else { $script:TR_Runtime }
-}
 
 # ---------------------------------------------------------------- runtime updates
 # Profiles dot-source the installed copy, never the module, so a new module version only takes effect once its
@@ -109,7 +48,8 @@ function Set-TRFileSwap([string]$Tmp, [string]$Path) {
 }
 function Copy-TRRuntime([string]$Src, [string]$Dst, [version]$Version) {
     if (-not (Test-Path -LiteralPath $Dst)) { New-Item -ItemType Directory -Force -Path $Dst | Out-Null }
-    foreach ($f in Get-ChildItem -LiteralPath $Src -File) {
+    # files new to $Dst first: an updated file may dot-source one the old runtime did not have
+    foreach ($f in Get-ChildItem -LiteralPath $Src -File | Sort-Object { [IO.File]::Exists((Join-Path $Dst $_.Name)) }, Name) {
         if ($f.Name -eq 'version.txt') { continue }
         $to = Join-Path $Dst $f.Name
         [IO.File]::Copy($f.FullName, "$to.$PID.tmp", $true)
@@ -157,23 +97,27 @@ function Find-TRNewestModule([string[]]$Roots = @(Get-TRModuleRoots)) {
             if (-not $v -or ($bestV -and $v -le $bestV)) { continue }
             # a version Update-Module is still copying in must not be taken (and stamped) half-populated
             $rt = Join-Path $d 'Runtime'
-            if (@('Common.ps1', 'tab-hook.ps1', 'guardian.ps1' | Where-Object { -not [IO.File]::Exists((Join-Path $rt $_)) }).Count -eq 0) { $best = $d; $bestV = $v }
+            if (@('Base.ps1', 'Common.ps1', 'tab-hook.ps1', 'guardian.ps1' | Where-Object { -not [IO.File]::Exists((Join-Path $rt $_)) }).Count -eq 0) { $best = $d; $bestV = $v }
         }
     }
     $best
 }
 
 # ---------------------------------------------------------------- tab files
+# <pid>.json is written by the tab's hook only; the guardian writes the sidecars <pid>.run.json (foreground child) and
+# <pid>.owner.json (owning WT), so neither ever rewrites a file the other one owns.
 function Get-TRTabFiles([string]$Dir) {
     if (-not (Test-Path -LiteralPath $Dir)) { return @() }
-    @(Get-ChildItem -LiteralPath $Dir -Filter '*.json' -File | Where-Object { $_.Name -notlike '*.run.json' })
+    @(Get-ChildItem -LiteralPath $Dir -Filter '*.json' -File | Where-Object { $_.Name -notlike '*.*.json' })
 }
 function Get-TRRunPath([string]$TabPath) { $TabPath -replace '\.json$', '.run.json' }
+function Get-TROwnerPath([string]$TabPath) { $TabPath -replace '\.json$', '.owner.json' }
+function Get-TRTabFileSet([string]$TabPath) { @($TabPath, (Get-TRRunPath $TabPath), (Get-TROwnerPath $TabPath)) }
 function Remove-TRTabFiles([string]$TabPath) {
-    foreach ($p in @($TabPath, (Get-TRRunPath $TabPath))) { if (Test-Path -LiteralPath $p) { [IO.File]::Delete($p) } }
+    foreach ($p in Get-TRTabFileSet $TabPath) { if (Test-Path -LiteralPath $p) { [IO.File]::Delete($p) } }
 }
 function Move-TRTabFiles([string]$TabPath, [string]$DestDir) {
-    foreach ($p in @($TabPath, (Get-TRRunPath $TabPath))) {
+    foreach ($p in Get-TRTabFileSet $TabPath) {
         if (Test-Path -LiteralPath $p) { Move-Item -LiteralPath $p -Destination $DestDir -Force -ErrorAction SilentlyContinue }
     }
 }
@@ -194,7 +138,34 @@ function Get-TRWtProcesses($SessionId) {
 }
 function Get-TRTabSession($Tab) { if ($null -ne $Tab.session) { [int]$Tab.session } else { Get-TRSessionId } }
 
-# The WT that owns a tab is recorded in the tab file (wtPid + wtStart, walked shell -> OpenConsole -> WindowsTerminal).
+# The tab file with the owning WT (wtPid + wtStart) merged in from the guardian's owner sidecar. Seeded tab files carry
+# the owner themselves. The sidecar must match shellStart: a reused PID must not inherit a stale owner.
+function Read-TRTab([string]$Path) {
+    $t = Read-TRJson $Path
+    if ($t -and -not $t.wtPid) {
+        $o = Read-TRJson (Get-TROwnerPath $Path)
+        if ($o -and [int64]$o.shellStart -eq [int64]$t.shellStart) {
+            $t | Add-Member wtPid $o.wtPid -Force; $t | Add-Member wtStart $o.wtStart -Force
+        }
+    }
+    $t
+}
+# shell -> OpenConsole -> WindowsTerminal in a CIM snapshot ($ById: ProcessId -> Win32_Process). $null when not under a WT.
+# A parent must be older than its child, or its PID was reused after the real parent ended.
+function Find-TROwnerInSnapshot([int]$ShellPid, $ById) {
+    $c = $ById[[uint32]$ShellPid]
+    if (-not $c) { return $null }
+    $p = $ById[[uint32]$c.ParentProcessId]
+    if ($p -and $p.Name -ieq 'OpenConsole.exe' -and $p.CreationDate -le $c.CreationDate) { $c = $p; $p = $ById[[uint32]$c.ParentProcessId] }
+    if ($p -and $p.Name -ieq 'WindowsTerminal.exe' -and $p.CreationDate -le $c.CreationDate) { return $p }
+    $null
+}
+# Records the owning WT of a live tab that has none yet (the hook leaves that to the guardian: its CIM snapshot is free).
+function Set-TRTabOwner([string]$TabPath, $Tab, $ById) {
+    if ($Tab.wtPid) { return }
+    $w = Find-TROwnerInSnapshot ([int]$Tab.shellPid) $ById
+    if ($w) { Write-TRJson (Get-TROwnerPath $TabPath) ([ordered]@{ shellPid = [int]$Tab.shellPid; shellStart = [int64]$Tab.shellStart; wtPid = [int]$w.ProcessId; wtStart = $w.CreationDate.Ticks }) }
+}
 # $true/$false = owner alive/gone, $null = owner unknown.
 function Test-TROwnerAlive($Tab) {
     if (-not $Tab.wtPid -or -not $Tab.wtStart) { return $null }
@@ -221,7 +192,7 @@ function Resolve-TRDeadTab($TabFile, $Tab) {
 function Invoke-TRSweep {
     Initialize-TRDirs
     foreach ($f in Get-TRTabFiles $script:TR_Live) {
-        $tab = Read-TRJson $f.FullName
+        $tab = Read-TRTab $f.FullName
         if (-not $tab -or (Test-TRShellAlive $tab $null)) { continue }
         if ($tab.exiting) { Remove-TRTabFiles $f.FullName; continue }
         if ((Get-TRDeadTabVerdict $tab) -eq 'ended') { Move-TRTabFiles $f.FullName $script:TR_Last }
@@ -256,18 +227,6 @@ function Get-TRLiveAliveTabs([int]$ExceptPid = 0) {
 }
 
 # ---------------------------------------------------------------- processes
-function Start-TRProcess {
-    # Launches a process with the Claude-Code / tool-shell environment removed (so tabs render with colour).
-    param([string]$FilePath, [string]$Arguments, [switch]$Hidden)
-    if ($env:TERMINALRESS_DRYRUN -eq '1') {
-        [IO.File]::AppendAllText((Join-Path $script:TR_State 'dryrun.log'), "$FilePath $Arguments`r`n", $script:TR_Utf8); return
-    }
-    $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = $FilePath; $psi.Arguments = $Arguments; $psi.UseShellExecute = $false
-    if ($Hidden) { $psi.CreateNoWindow = $true }
-    foreach ($k in @($psi.EnvironmentVariables.Keys)) { if ($k -match $script:TR_ScrubRegex) { $psi.EnvironmentVariables.Remove($k) } }
-    [void][Diagnostics.Process]::Start($psi)
-}
 function Get-TRWtPath($Owner) {
     # the wt.exe that sits next to the WindowsTerminal.exe that owns the current tab comes first, so a second
     # install (portable copy, preview) restores into ITS OWN terminal
@@ -292,27 +251,6 @@ function Get-TRWtPath($Owner) {
     }
     $null
 }
-function Test-TRMutexExists([string]$Name) {
-    $m = $null
-    $r = [Threading.Mutex]::TryOpenExisting($Name, [ref]$m)
-    if ($m) { $m.Dispose() }
-    $r
-}
-# A guardian started before an upgrade keeps its MD5-named mutex until it exits; without this a second one would start.
-# Under FIPS MD5 throws, but then no old guardian can have run either.
-function Test-TRLegacyGuardian { try { Test-TRMutexExists (Get-TRMutexName 'Guardian' -Legacy) } catch { $false } }
-function Test-TRGuardianRunning { (Test-TRMutexExists (Get-TRMutexName 'Guardian')) -or (Test-TRLegacyGuardian) }
-function Start-TRGuardianProcess {
-    if (Test-TRGuardianRunning) { return $false }
-    Initialize-TRDirs
-    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $script = Join-Path (Get-TRRuntimeDir) 'guardian.ps1'
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $script + '"'
-    # a test/alternate state dir must be inherited by the guardian: it is, through the environment.
-    Start-TRProcess $psExe $arguments -Hidden
-    $true
-}
-
 # ---------------------------------------------------------------- argv / resume handlers
 function Get-TRArgv([string]$CommandLine) {
     if (-not ('TRNative.Args' -as [type])) {
