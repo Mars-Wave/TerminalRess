@@ -17,7 +17,10 @@ $deadSince = @{}     # shellPid -> first seen dead
 $noChild   = @{}     # shellPid -> consecutive loops without a foreground child
 $runSig    = @{}     # shellPid -> last written signature
 $ignoreNames = 'conhost.exe', 'OpenConsole.exe'
-Write-TRLog "guardian started pid=$PID session=$mySession state=$TR_State"
+$selfVer = Get-TRRuntimeVersion $PSScriptRoot
+$nextSync = [DateTime]::MinValue
+$restart = $false
+Write-TRLog "guardian started pid=$PID session=$mySession state=$TR_State version=$selfVer"
 
 function Get-RunInfo($child, $shellPid) {
     $argv = @()
@@ -26,6 +29,15 @@ function Get-RunInfo($child, $shellPid) {
     $resume = Get-TRResumeCommand $child $argv
     if ($resume) { $info['resume'] = $resume }
     $info
+}
+
+# Picks up Update-Module: copies the newest installed module's Runtime\ over an older runtime copy, and reports whether
+# this guardian runs from that copy with older code (then it must restart to run the new one).
+function Sync-Runtime {
+    $null = Update-TRRuntime (Find-TRNewestModule)
+    if ($PSScriptRoot.TrimEnd('\') -ne $TR_InstalledRuntime.TrimEnd('\')) { return $false }
+    $v = Get-TRRuntimeVersion
+    [bool]($v -and (-not $selfVer -or $v -gt $selfVer))
 }
 
 function Invoke-Tick {
@@ -75,11 +87,20 @@ function Invoke-Tick {
 
 try {
     do {
+        if ([DateTime]::UtcNow -ge $nextSync) {
+            $nextSync = [DateTime]::UtcNow.AddMinutes(5)
+            try { $restart = Sync-Runtime } catch { Write-TRLog "runtime sync error: $($_.Exception.Message)" }
+            if ($restart) { break }
+        }
         try { Invoke-Tick } catch { Write-TRLog "tick error: $($_.Exception.Message)" }
         if ($Once) { break }
         Start-Sleep -Seconds $IntervalSec
     } while ($true)
 } finally {
-    try { $mutex.ReleaseMutex() } catch { }
+    $mutex.Dispose()     # the named mutex must be gone before the replacement starts, or it would exit at once
     Remove-Item -LiteralPath (Join-Path $TR_State 'guardian.pid') -Force -ErrorAction SilentlyContinue
+}
+if ($restart) {
+    Write-TRLog "guardian restarting on runtime $(Get-TRRuntimeVersion)"
+    $null = Start-TRGuardianProcess
 }

@@ -11,6 +11,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 $state = Join-Path $work 'state'
 $env:TERMINALRESS_STATE = $state
 $env:TERMINALRESS_DRYRUN = '1'
+$env:TERMINALRESS_RUNTIME = Join-Path $work 'runtime'      # never the real installed runtime (module import syncs it)
 $env:CLAUDE_CONFIG_DIR = Join-Path $work 'claude'
 New-Item -ItemType Directory -Force -Path (Join-Path $env:CLAUDE_CONFIG_DIR 'sessions') | Out-Null
 
@@ -138,7 +139,7 @@ try {
     Reset-State; & $mod { Initialize-TRDirs }
     $wt = @([Diagnostics.Process]::GetProcessesByName('WindowsTerminal') | Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId })
     $live = Join-Path $state 'live'
-    $before = (Get-Date).AddHours(-2).Ticks
+    $before = (@($wt | ForEach-Object { $_.StartTime }) + (Get-Date) | Sort-Object | Select-Object -First 1).AddHours(-2).Ticks   # older than any running WT
     New-FakeTab 99991 $before 'C:\' $null 'old' $null $live
     & $mod { Invoke-TRSweep }
     Assert ((Test-Path (Join-Path $state 'last\99991.json')) -and -not (Test-Path (Join-Path $live '99991.json'))) 'dead tab from before the current WT started is moved to last (previous generation)'
@@ -381,9 +382,61 @@ elseif (`$Mode -eq 'claude') {
     Assert (-not ($g0 -match 'PRE-ADOPT-CALLED')) 'nothing saved and nothing dead: pre-adopt is not loaded'
     Assert (-not ($g1 -match 'PRE-ADOPT-CALLED')) 'only live tabs: pre-adopt is not loaded'
     Assert ($g2 -match 'PRE-ADOPT-CALLED') 'a dead tab not yet swept into last\ still triggers pre-adopt'
+
+    Section 'runtime auto-update'
+    $rt = $env:TERMINALRESS_RUNTIME
+    $srcHook = [IO.File]::ReadAllText((Join-Path $modDir 'Runtime\tab-hook.ps1'))
+    Assert (-not (Test-Path $rt)) 'module import with TerminalRess not installed creates no runtime'
+    Assert (-not (& $mod { Update-TRRuntime $TR_ModuleRoot }) -and -not (Test-Path $rt)) 'not installed: update is a no-op and creates nothing'
+    $st = Get-TerminalRessStatus
+    Assert ($st.ModuleVersion -eq [version]'1.0.0' -and $null -eq $st.RuntimeVersion) "status: module $($st.ModuleVersion), no runtime"
+    New-Item -ItemType Directory -Force -Path $rt | Out-Null
+    'old' | Set-Content (Join-Path $rt 'tab-hook.ps1')
+    Assert (& $mod { Update-TRRuntime $TR_ModuleRoot }) 'unstamped (pre-version.txt) runtime is updated'
+    '0.9.0' | Set-Content (Join-Path $rt 'version.txt'); 'old' | Set-Content (Join-Path $rt 'tab-hook.ps1')
+    Assert (& $mod { Update-TRRuntime $TR_ModuleRoot }) 'older runtime: updated'
+    Assert ([IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook -and (Test-Path (Join-Path $rt 'guardian.ps1'))) 'runtime files replaced by the module copy'
+    Assert ((Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq '1.0.0' -and (Get-TerminalRessStatus).RuntimeVersion -eq [version]'1.0.0') 'runtime stamped with the module version (status shows it)'
+    Assert (@(Get-ChildItem $rt -Filter '*.tmp').Count -eq 0) 'no staging files left behind'
+    foreach ($v in '1.0.0', '2.0.0') {
+        $v | Set-Content (Join-Path $rt 'version.txt'); 'local' | Set-Content (Join-Path $rt 'tab-hook.ps1')
+        $u = & $mod { Update-TRRuntime $TR_ModuleRoot }
+        Assert (-not $u -and (Get-Content (Join-Path $rt 'tab-hook.ps1') -Raw).Trim() -eq 'local' -and (Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq $v) "runtime $v vs module 1.0.0: untouched"
+    }
+
+    $roots = Join-Path $work 'modroots'
+    foreach ($x in @(@('a', 'TerminalRess\1.0.0', '1.0.0', $true), @('b', 'TerminalRess\1.2.0', '1.2.0', $true), @('a', 'TerminalRess\1.5.0', '1.5.0', $false), @('c', 'TerminalRess', '1.1.0', $true))) {
+        $d = Join-Path $roots "$($x[0])\$($x[1])"
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        "@{ ModuleVersion = '$($x[2])' }" | Set-Content (Join-Path $d 'TerminalRess.psd1')
+        New-Item -ItemType Directory -Force -Path (Join-Path $d 'Runtime') | Out-Null
+        foreach ($f in @(if ($x[3]) { 'Common.ps1', 'tab-hook.ps1', 'guardian.ps1' } else { 'Common.ps1' })) { '' | Set-Content (Join-Path $d "Runtime\$f") }
+    }
+    $best = & $mod { param($r) Find-TRNewestModule $r } @((Join-Path $roots 'a'), (Join-Path $roots 'b'), (Join-Path $roots 'c'), (Join-Path $roots 'none'))
+    Assert ($best -eq (Join-Path $roots 'b\TerminalRess\1.2.0')) "newest complete module across roots (versioned + flat layouts, half-copied one skipped): $best"
+    $mr = & $mod { @(Get-TRModuleRoots) }
+    Assert (@($mr | Where-Object { $_ -like '*\PowerShell\Modules' }).Count -ge 1 -and @($mr | Where-Object { $_ -like '*\WindowsPowerShell\Modules' }).Count -ge 1) 'module roots cover both editions'
+
+    Reset-State
+    '0.9.0' | Set-Content (Join-Path $rt 'version.txt'); 'old' | Set-Content (Join-Path $rt 'tab-hook.ps1')
+    $o = Invoke-ChildShell "Import-Module '$(Join-Path $modDir 'TerminalRess.psd1')'; 'IMPORTED'"
+    Assert ($o -match 'IMPORTED' -and (Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq '1.0.0' -and [IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook) 'module import upgrades an older installed runtime'
+
+    # a guardian running from an older installed runtime finds the newer module, updates the runtime and restarts itself
+    Reset-State
+    Get-ChildItem $rt -File | Remove-Item
+    Copy-Item (Join-Path $modDir 'Runtime\*') $rt
+    '0.9.0' | Set-Content (Join-Path $rt 'version.txt'); 'old' | Set-Content (Join-Path $rt 'tab-hook.ps1')
+    try { $env:TERMINALRESS_MODULEROOTS = $root; & $psExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $rt 'guardian.ps1') -Once | Out-Null }
+    finally { Remove-Item Env:\TERMINALRESS_MODULEROOTS }
+    $glog = Get-Content (Join-Path $state 'guardian.log') -Raw
+    $dry = Get-Content (Join-Path $state 'dryrun.log') -Raw -ErrorAction SilentlyContinue
+    Assert ((Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq '1.0.0' -and [IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook) 'guardian updates an older installed runtime from the newest module'
+    Assert ($glog -match 'guardian restarting on runtime 1\.0\.0' -and $dry -like "*$(Join-Path $rt 'guardian.ps1')*") 'guardian exits and relaunches itself on the new runtime'
+    Assert (-not (Test-Path (Join-Path $state 'guardian.pid')) -and -not (& $mod { Test-TRGuardianRunning })) 'old guardian released its mutex and pid file'
 }
 finally {
-    Remove-Item Env:\TERMINALRESS_FORCE, Env:\TERMINALRESS_DRYRUN, Env:\TERMINALRESS_STATE, Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+    Remove-Item Env:\TERMINALRESS_FORCE, Env:\TERMINALRESS_MODULEROOTS, Env:\TERMINALRESS_DRYRUN, Env:\TERMINALRESS_STATE, Env:\TERMINALRESS_RUNTIME, Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
     try { [IO.Directory]::Delete($work, $true) } catch { Write-Host "  (could not delete $work)" -ForegroundColor Yellow }
 }
 Write-Host ("`n{0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail) { 'Red' } else { 'Green' })

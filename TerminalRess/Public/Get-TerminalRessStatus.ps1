@@ -22,6 +22,8 @@ function Get-TerminalRessStatus {
         State            = $script:TR_State
         GuardianRunning  = Test-TRGuardianRunning
         GuardianPid      = if (Test-Path -LiteralPath $pidFile) { [int](Get-Content -LiteralPath $pidFile -Raw) } else { $null }
+        ModuleVersion    = Get-TRModuleVersion $script:TR_ModuleRoot
+        RuntimeVersion   = if ([IO.Directory]::Exists($script:TR_InstalledRuntime)) { Get-TRRuntimeVersion } else { $null }
         WindowsTerminal  = Get-TRWtPath
         TrackedTabs      = @($tabs)
         LastGeneration   = @($last)

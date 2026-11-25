@@ -3,7 +3,7 @@ function Install-TerminalRess {
     .SYNOPSIS
         Installs tab resurrection for Windows Terminal: profile hooks, runtime scripts, optional logon shortcut.
     .DESCRIPTION
-        - copies the runtime scripts to %LOCALAPPDATA%\TerminalRess\runtime
+        - copies the runtime scripts to %LOCALAPPDATA%\TerminalRess\runtime (later module versions update it on their own)
         - adds a pre-hook at the TOP and the main hook at the END of the profile (backup first; idempotent)
         - writes config.json if missing
         - creates a Startup shortcut (hidden, via wscript) unless -NoLogonRestore
@@ -37,8 +37,7 @@ function Install-TerminalRess {
     $runtimeSrc = $script:TR_Runtime
     $runtimeDst = $script:TR_InstalledRuntime
     if ($PSCmdlet.ShouldProcess($runtimeDst, 'Copy runtime scripts')) {
-        if (-not (Test-Path -LiteralPath $runtimeDst)) { New-Item -ItemType Directory -Force -Path $runtimeDst | Out-Null }
-        Get-ChildItem -LiteralPath $runtimeSrc -File | Copy-Item -Destination $runtimeDst -Force
+        Copy-TRRuntime $runtimeSrc $runtimeDst (Get-TRModuleVersion $script:TR_ModuleRoot)
     }
 
     $cfgPath = Join-Path $script:TR_State 'config.json'

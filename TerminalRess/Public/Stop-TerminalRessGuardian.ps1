@@ -11,6 +11,7 @@ function Stop-TerminalRessGuardian {
     $p = Get-CimInstance Win32_Process -Filter "ProcessId=$gpid" -ErrorAction SilentlyContinue
     if ($p -and $p.CommandLine -like '*guardian.ps1*') {
         Stop-Process -Id $gpid -Force
+        Wait-Process -Id $gpid -Timeout 5 -ErrorAction SilentlyContinue   # its mutex lives until it is gone
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
         return $true
     }

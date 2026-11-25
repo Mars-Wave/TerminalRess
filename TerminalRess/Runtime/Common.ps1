@@ -9,7 +9,7 @@ $script:TR_Live    = Join-Path $script:TR_State 'live'
 $script:TR_Last    = Join-Path $script:TR_State 'last'
 $script:TR_Archive = Join-Path $script:TR_State 'archive'
 $script:TR_Utf8    = New-Object Text.UTF8Encoding $false
-$script:TR_InstalledRuntime = Join-Path $env:LOCALAPPDATA 'TerminalRess\runtime'
+$script:TR_InstalledRuntime = if ($env:TERMINALRESS_RUNTIME) { $env:TERMINALRESS_RUNTIME } else { Join-Path $env:LOCALAPPDATA 'TerminalRess\runtime' }
 $script:TR_ScrubRegex = '^(CLAUDE|NO_COLOR$|GIT_TERMINAL_PROMPT$|WT_SESSION$|WT_PROFILE_ID$|POSH_|TERMINALRESS_RESTORING$|TERMINALRESS_FORCE$)'
 $script:TR_ConfigCache = $null
 
@@ -80,6 +80,87 @@ function Get-TRMutexName([string]$Kind, [switch]$Legacy) { "Local\TerminalRess-$
 function Get-TRSessionId { [Diagnostics.Process]::GetCurrentProcess().SessionId }
 function Get-TRRuntimeDir {
     if (Test-Path -LiteralPath (Join-Path $script:TR_InstalledRuntime 'guardian.ps1')) { $script:TR_InstalledRuntime } else { $script:TR_Runtime }
+}
+
+# ---------------------------------------------------------------- runtime updates
+# Profiles dot-source the installed copy, never the module, so a new module version only takes effect once its
+# Runtime\ is copied over. runtime\version.txt records the module version the copy came from.
+function Get-TRModuleVersion([string]$ModuleDir) {
+    $p = Join-Path $ModuleDir 'TerminalRess.psd1'
+    if (-not [IO.File]::Exists($p)) { return $null }
+    $m = [regex]::Match([IO.File]::ReadAllText($p), "ModuleVersion\s*=\s*'([0-9.]+)'")
+    if ($m.Success) { [version]$m.Groups[1].Value } else { $null }
+}
+function Get-TRRuntimeVersion([string]$Dir = $script:TR_InstalledRuntime) {
+    $p = Join-Path $Dir 'version.txt'
+    $v = $null
+    if ([IO.File]::Exists($p) -and [version]::TryParse([IO.File]::ReadAllText($p).Trim(), [ref]$v)) { $v } else { $null }
+}
+function Set-TRFileSwap([string]$Tmp, [string]$Path) {
+    # A shell dot-sourcing $Path sees the old or the new file, never half of one; a reader holding it open only delays the swap.
+    try {
+        for ($i = 1; ; $i++) {
+            try {
+                if ([IO.File]::Exists($Path)) { [IO.File]::Replace($Tmp, $Path, [NullString]::Value) } else { [IO.File]::Move($Tmp, $Path) }
+                return
+            } catch { if ($i -ge 10) { throw }; Start-Sleep -Milliseconds 200 }
+        }
+    } finally { if ([IO.File]::Exists($Tmp)) { [IO.File]::Delete($Tmp) } }
+}
+function Copy-TRRuntime([string]$Src, [string]$Dst, [version]$Version) {
+    if (-not (Test-Path -LiteralPath $Dst)) { New-Item -ItemType Directory -Force -Path $Dst | Out-Null }
+    foreach ($f in Get-ChildItem -LiteralPath $Src -File) {
+        if ($f.Name -eq 'version.txt') { continue }
+        $to = Join-Path $Dst $f.Name
+        [IO.File]::Copy($f.FullName, "$to.$PID.tmp", $true)
+        Set-TRFileSwap "$to.$PID.tmp" $to
+    }
+    # stamped last: an interrupted copy stays older and is retried by the next sync
+    $vf = Join-Path $Dst 'version.txt'
+    [IO.File]::WriteAllText("$vf.$PID.tmp", [string]$Version, $script:TR_Utf8)
+    Set-TRFileSwap "$vf.$PID.tmp" $vf
+}
+function Update-TRRuntime([string]$ModuleDir) {
+    # Upgrade only, and only an installed runtime: never creates it, never downgrades.
+    if (-not $ModuleDir -or -not [IO.Directory]::Exists($script:TR_InstalledRuntime)) { return $false }
+    $v = Get-TRModuleVersion $ModuleDir
+    $src = Join-Path $ModuleDir 'Runtime'
+    if (-not $v -or -not [IO.Directory]::Exists($src)) { return $false }
+    # check-and-copy under one lock: an older module (the other edition's folder) must not slip in after a newer one
+    $created = $false
+    $m = New-Object Threading.Mutex($false, (Get-TRMutexName 'Runtime'), [ref]$created)
+    try { $null = $m.WaitOne(30000) } catch [Threading.AbandonedMutexException] { }
+    try {
+        $cur = Get-TRRuntimeVersion
+        if ($cur -and $cur -ge $v) { return $false }
+        Copy-TRRuntime $src $script:TR_InstalledRuntime $v
+    } finally { try { $m.ReleaseMutex() } catch { }; $m.Dispose() }
+    Write-TRLog "runtime updated $cur -> $v from $ModuleDir"
+    $true
+}
+function Get-TRModuleRoots {
+    if ($env:TERMINALRESS_MODULEROOTS) { return @($env:TERMINALRESS_MODULEROOTS -split ';' | Where-Object { $_ }) }
+    # both editions: the guardian runs under 5.1, whose PSModulePath lacks the pwsh 7 folders
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    $r = @($env:PSModulePath -split ';') + @((Join-Path $docs 'WindowsPowerShell\Modules'), (Join-Path $docs 'PowerShell\Modules'),
+        (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'), (Join-Path $env:ProgramFiles 'PowerShell\Modules'))
+    $seen = @{}
+    foreach ($x in $r) { if ($x) { $k = $x.TrimEnd('\').ToLowerInvariant(); if (-not $seen[$k]) { $seen[$k] = 1; $x.TrimEnd('\') } } }
+}
+function Find-TRNewestModule([string[]]$Roots = @(Get-TRModuleRoots)) {
+    $best = $null; $bestV = $null
+    foreach ($r in $Roots) {
+        $base = Join-Path $r 'TerminalRess'
+        if (-not [IO.Directory]::Exists($base)) { continue }
+        foreach ($d in @($base) + @([IO.Directory]::GetDirectories($base))) {
+            $v = Get-TRModuleVersion $d
+            if (-not $v -or ($bestV -and $v -le $bestV)) { continue }
+            # a version Update-Module is still copying in must not be taken (and stamped) half-populated
+            $rt = Join-Path $d 'Runtime'
+            if (@('Common.ps1', 'tab-hook.ps1', 'guardian.ps1' | Where-Object { -not [IO.File]::Exists((Join-Path $rt $_)) }).Count -eq 0) { $best = $d; $bestV = $v }
+        }
+    }
+    $best
 }
 
 # ---------------------------------------------------------------- tab files

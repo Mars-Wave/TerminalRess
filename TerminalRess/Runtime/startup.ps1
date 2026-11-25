@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Common.ps1')
 Initialize-TRDirs
 $cfg = Get-TRConfig
+try { $null = Update-TRRuntime (Find-TRNewestModule) } catch { Write-TRLog "runtime update failed: $($_.Exception.Message)" }
 $null = Start-TRGuardianProcess
 Invoke-TRSweep
 if (-not $cfg.restoreOnLogon) { return }
