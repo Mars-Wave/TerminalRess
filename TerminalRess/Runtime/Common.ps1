@@ -123,15 +123,9 @@ function Move-TRTabFiles([string]$TabPath, [string]$DestDir) {
 }
 
 # ---------------------------------------------------------------- liveness
-# $ById: optional CIM snapshot map (guardian). Without it, .NET Get-Process is used (cheap, no CIM).
-function Test-TRShellAlive($Tab, $ById) {
-    $ticks = [int64]$Tab.shellStart
-    if ($ById) {
-        $p = $ById[[uint32]$Tab.shellPid]
-        if (-not $p -or -not $p.CreationDate) { return $false }
-        return ([math]::Abs($p.CreationDate.Ticks - $ticks) -lt 30000000)
-    }
-    try { $p = [Diagnostics.Process]::GetProcessById([int]$Tab.shellPid); return ([math]::Abs($p.StartTime.Ticks - $ticks) -lt 30000000) } catch { return $false }
+# .NET, no CIM (the guardian uses [TRNative.Procs]::IsAlive).
+function Test-TRShellAlive($Tab) {
+    try { $p = [Diagnostics.Process]::GetProcessById([int]$Tab.shellPid); return ([math]::Abs($p.StartTime.Ticks - [int64]$Tab.shellStart) -lt 30000000) } catch { return $false }
 }
 function Get-TRWtProcesses($SessionId) {
     @([Diagnostics.Process]::GetProcessesByName('WindowsTerminal') | Where-Object { $null -eq $SessionId -or $_.SessionId -eq $SessionId })
@@ -150,7 +144,8 @@ function Read-TRTab([string]$Path) {
     }
     $t
 }
-# shell -> OpenConsole -> WindowsTerminal in a CIM snapshot ($ById: ProcessId -> Win32_Process). $null when not under a WT.
+# shell -> OpenConsole -> WindowsTerminal in a process snapshot ($ById: ProcessId -> object with ParentProcessId, Name and
+# CreationDate, as Win32_Process or TRNative.Proc). $null when not under a WT.
 # A parent must be older than its child, or its PID was reused after the real parent ended.
 function Find-TROwnerInSnapshot([int]$ShellPid, $ById) {
     $c = $ById[[uint32]$ShellPid]
@@ -160,7 +155,7 @@ function Find-TROwnerInSnapshot([int]$ShellPid, $ById) {
     if ($p -and $p.Name -ieq 'WindowsTerminal.exe' -and $p.CreationDate -le $c.CreationDate) { return $p }
     $null
 }
-# Records the owning WT of a live tab that has none yet (the hook leaves that to the guardian: its CIM snapshot is free).
+# Records the owning WT of a live tab that has none yet (the hook leaves that to the guardian, which has a process snapshot).
 function Set-TRTabOwner([string]$TabPath, $Tab, $ById) {
     if ($Tab.wtPid) { return }
     $w = Find-TROwnerInSnapshot ([int]$Tab.shellPid) $ById
@@ -193,7 +188,7 @@ function Invoke-TRSweep {
     Initialize-TRDirs
     foreach ($f in Get-TRTabFiles $script:TR_Live) {
         $tab = Read-TRTab $f.FullName
-        if (-not $tab -or (Test-TRShellAlive $tab $null)) { continue }
+        if (-not $tab -or (Test-TRShellAlive $tab)) { continue }
         if ($tab.exiting) { Remove-TRTabFiles $f.FullName; continue }
         if ((Get-TRDeadTabVerdict $tab) -eq 'ended') { Move-TRTabFiles $f.FullName $script:TR_Last }
     }
@@ -222,7 +217,7 @@ function Get-TROwnerWt([int]$ShellPid = $PID) {
 function Get-TRLiveAliveTabs([int]$ExceptPid = 0) {
     foreach ($f in Get-TRTabFiles $script:TR_Live) {
         $t = Read-TRJson $f.FullName
-        if ($t -and [int]$t.shellPid -ne $ExceptPid -and (Test-TRShellAlive $t $null)) { $t }
+        if ($t -and [int]$t.shellPid -ne $ExceptPid -and (Test-TRShellAlive $t)) { $t }
     }
 }
 
@@ -266,6 +261,279 @@ public static string[] Split(string cl) {
 '@
     }
     [string[]][TRNative.Args]::Split($CommandLine)
+}
+
+# ---------------------------------------------------------------- guardian loop
+# The guardian runs for days, so its loop must cost next to nothing: processes are checked by PID, the process table is read
+# with Toolhelp (a fifth of a full Win32_Process query, and no WmiPrvSE work) only when needed, and its wait wakes on a tab
+# file change or a tab shell exit instead of polling fast.
+function Initialize-TRNativeProcs {
+    if ('TRNative.Procs' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+namespace TRNative {
+public sealed class Proc {
+    public uint ProcessId; public uint ParentProcessId; public string Name;
+    bool queried; DateTime? created;
+    // local time like Win32_Process.CreationDate and Process.StartTime; null when the process cannot be opened
+    public DateTime? CreationDate { get { if (!queried) { queried = true; created = Procs.StartTime(ProcessId); } return created; } }
+}
+public sealed class ProcSnapshot {
+    public Hashtable ById = new Hashtable();
+    readonly Dictionary<uint, List<Proc>> byParent = new Dictionary<uint, List<Proc>>();
+    internal void Add(Proc p) {
+        ById[p.ProcessId] = p;
+        List<Proc> l;
+        if (!byParent.TryGetValue(p.ParentProcessId, out l)) { l = new List<Proc>(); byParent[p.ParentProcessId] = l; }
+        l.Add(p);
+    }
+    public Proc[] Children(int pid) { List<Proc> l; return byParent.TryGetValue((uint)pid, out l) ? l.ToArray() : new Proc[0]; }
+}
+public static class Procs {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct Entry {
+        public uint dwSize, cntUsage, th32ProcessID; public IntPtr th32DefaultHeapID; public uint th32ModuleID, cntThreads, th32ParentProcessID;
+        public int pcPriClassBase; public uint dwFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32FirstW(IntPtr h, ref Entry e);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32NextW(IntPtr h, ref Entry e);
+    [DllImport("kernel32.dll")] internal static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] internal static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
+    public static ProcSnapshot Snapshot() {
+        IntPtr h = CreateToolhelp32Snapshot(2, 0);
+        if (h == new IntPtr(-1)) throw new InvalidOperationException("CreateToolhelp32Snapshot failed: " + Marshal.GetLastWin32Error());
+        try {
+            var s = new ProcSnapshot();
+            var e = new Entry(); e.dwSize = (uint)Marshal.SizeOf(typeof(Entry));
+            for (bool ok = Process32FirstW(h, ref e); ok; ok = Process32NextW(h, ref e)) {
+                if (e.th32ProcessID == 0) continue;
+                var p = new Proc(); p.ProcessId = e.th32ProcessID; p.ParentProcessId = e.th32ParentProcessID; p.Name = e.szExeFile;
+                s.Add(p);
+            }
+            return s;
+        } finally { CloseHandle(h); }
+    }
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+    public static DateTime? StartTime(uint pid) {
+        IntPtr h = OpenProcess(0x1000, false, pid);
+        if (h == IntPtr.Zero) return null;
+        try { long c, x, k, u; return GetProcessTimes(h, out c, out x, out k, out u) ? DateTime.FromFileTime(c) : (DateTime?)null; }
+        finally { CloseHandle(h); }
+    }
+    // running (an exited process stays openable while anyone holds a handle) and started within 3 s of startTicks: not a reused PID
+    public static bool IsAlive(int pid, long startTicks) {
+        IntPtr h = OpenProcess(0x1000, false, (uint)pid);
+        if (h == IntPtr.Zero) return false;
+        try {
+            uint code; long c, x, k, u;
+            if (!GetExitCodeProcess(h, out code) || code != 259 || !GetProcessTimes(h, out c, out x, out k, out u)) return false;
+            return Math.Abs(DateTime.FromFileTime(c).Ticks - startTicks) < 30000000;
+        } finally { CloseHandle(h); }
+    }
+}
+public sealed class Waiter : IDisposable {
+    [DllImport("kernel32.dll")] static extern uint WaitForMultipleObjects(uint n, IntPtr[] handles, bool all, uint ms);
+    readonly AutoResetEvent changed = new AutoResetEvent(false);
+    readonly FileSystemWatcher watcher;
+    public Waiter(string dir) {
+        watcher = new FileSystemWatcher(dir);
+        watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite;
+        watcher.Created += OnChange; watcher.Changed += OnChange; watcher.Deleted += OnChange; watcher.Renamed += OnChange;
+        watcher.EnableRaisingEvents = true;
+    }
+    void OnChange(object sender, FileSystemEventArgs e) {
+        // tab files (<pid>.json) only: the guardian's own sidecar writes must not wake it
+        string n = e.Name;
+        if (n != null && n.EndsWith(".json", StringComparison.OrdinalIgnoreCase) && n.IndexOf('.') == n.Length - 5) changed.Set();
+    }
+    // 0 = timed out, 1 = a tab file changed, 2 = one of the processes ended
+    public int Wait(int ms, int[] pids) {
+        var hs = new List<IntPtr>(); hs.Add(changed.SafeWaitHandle.DangerousGetHandle());
+        try {
+            foreach (int pid in pids) { if (hs.Count >= 64) break; IntPtr h = Procs.OpenProcess(0x00100000, false, (uint)pid); if (h != IntPtr.Zero) hs.Add(h); }
+            uint r = WaitForMultipleObjects((uint)hs.Count, hs.ToArray(), false, (uint)ms);
+            if (r == 0) return 1;
+            if (r < (uint)hs.Count) return 2;
+            if (r == 0xFFFFFFFF) Thread.Sleep(ms);
+            return 0;
+        } finally { for (int i = 1; i < hs.Count; i++) Procs.CloseHandle(hs[i]); }
+    }
+    // one write raises several notifications: drop the rest once the loop is about to look anyway
+    public void Reset() { changed.Reset(); }
+    public void Dispose() { watcher.Dispose(); changed.Dispose(); }
+}
+}
+'@
+}
+function New-TRGuardianState {
+    $native = $true
+    try { Initialize-TRNativeProcs } catch {     # no C# compiler (AV, policy, Constrained Language): fall back to the slower path
+        $native = $false; Write-TRLog "native process helpers unavailable, using Get-Process and CIM: $($_.Exception.Message)"
+    }
+    @{
+        Native = $native
+        Grace = [int](Get-TRConfig).graceSeconds; Session = Get-TRSessionId; SessionsDir = Get-TRClaudeSessionsDir
+        IgnoreNames = @('conhost.exe', 'OpenConsole.exe')
+        Tabs      = @{}    # tab path -> @{ Stamp; Tab }: a tab file is parsed again only when it or its owner sidecar changes
+        Child     = @{}    # shellPid -> its foreground child (pid, start, name, exe, command line)
+        NextScan  = @{}    # shellPid -> when to look for a child again in a tab that runs a command without one
+        ReadAt    = @{}    # shellPid -> when its tab file last changed: a just-typed command may start its child late
+        QuickScanSec = 15
+        Claude    = $false # a claude.exe child is known: /resume and /clear are seen only on a loop, so no idle interval
+        DeadSince = @{}    # shellPid -> first seen dead
+        NoChild   = @{}    # shellPid -> consecutive loops without a foreground child
+        RunKey    = @{}    # shellPid -> child pid|start|claude sessions file time the run file was built from
+        RunSig    = @{}    # shellPid -> last written run file content
+        Alive     = New-Object 'Collections.Generic.List[int]'   # live tab shells to wake on when they end
+        Idle      = 0      # consecutive loops in which nothing changed
+        IdleAfter = 5
+    }
+}
+function Get-TRRunInfo($Child, [int]$ShellPid) {
+    $argv = @()
+    try { if ($Child.CommandLine) { $argv = Get-TRArgv $Child.CommandLine } } catch { }
+    $info = [ordered]@{ shellPid = $ShellPid; childPid = [int]$Child.ProcessId; name = $Child.Name; exe = $Child.ExecutablePath; commandLine = $Child.CommandLine; argv = $argv }
+    $resume = Get-TRResumeCommand $Child $argv
+    if ($resume) { $info['resume'] = $resume }
+    $info
+}
+function Test-TRProcAlive($G, [int]$Id, [long]$StartTicks) {
+    if ($G.Native) { return [TRNative.Procs]::IsAlive($Id, $StartTicks) }
+    try { $p = [Diagnostics.Process]::GetProcessById($Id); -not $p.HasExited -and [Math]::Abs($p.StartTime.Ticks - $StartTicks) -lt 30000000 } catch { $false }
+}
+# A process table with ById (uint32 pid -> process with ParentProcessId, Name, CreationDate) and Children(pid).
+function Get-TRProcSnapshot($G) {
+    if ($G.Native) { return [TRNative.Procs]::Snapshot() }
+    $byId = @{}; $byParent = @{}
+    foreach ($p in Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CreationDate) {
+        $byId[[uint32]$p.ProcessId] = $p
+        $l = $byParent[[uint32]$p.ParentProcessId]
+        if (-not $l) { $l = New-Object 'Collections.Generic.List[object]'; $byParent[[uint32]$p.ParentProcessId] = $l }
+        $l.Add($p)
+    }
+    $s = [pscustomobject]@{ ById = $byId; ByParent = $byParent }
+    $s | Add-Member ScriptMethod Children { param($Id) $l = $this.ByParent[[uint32]$Id]; if ($l) { $l.ToArray() } }
+    $s
+}
+# The foreground program of a live shell in a process snapshot: claude.exe first, else the newest child. $null when there is none.
+function Get-TRForegroundChild($G, $Snap, [int]$ShellPid) {
+    $start = $Snap.ById[[uint32]$ShellPid].CreationDate
+    $kids = @(foreach ($k in $Snap.Children($ShellPid)) {
+        # a child older than the shell belonged to an earlier owner of the PID; this guardian itself is spawned by the first tab
+        if ($k.ProcessId -ne $PID -and $G.IgnoreNames -notcontains $k.Name -and $k.CreationDate -ge $start) { $k }
+    })
+    if ($kids.Count -gt 1) { $kids = @($kids | Sort-Object @{ e = { $_.Name -ine 'claude.exe' } }, @{ e = { $_.CreationDate }; Descending = $true }) }
+    foreach ($k in $kids) {
+        $c = Get-CimInstance Win32_Process -Filter "ProcessId=$($k.ProcessId)" -Property ProcessId,CommandLine,ExecutablePath -ErrorAction SilentlyContinue
+        if (-not $c -or $c.CommandLine -like '*guardian.ps1*') { continue }   # gone, or another state dir's guardian
+        return [pscustomobject]@{ ProcessId = [int]$k.ProcessId; Start = $k.CreationDate.Ticks; Name = $k.Name; ExecutablePath = $c.ExecutablePath; CommandLine = $c.CommandLine }
+    }
+    $null
+}
+# One guardian loop over live\: records foreground children and owners of live tabs, resolves dead ones after the grace
+# period. Returns $true when anything changed or is still pending ($G.Idle counts the quiet loops in a row).
+# The process snapshot is taken only when a tab changed or lost its foreground child: a running program is re-checked by PID.
+function Invoke-TRGuardianTick($G) {
+    $active = $false
+    $G.Alive.Clear(); $G.Claude = $false
+    $all = @{}
+    if ([IO.Directory]::Exists($script:TR_Live)) { foreach ($fi in ([IO.DirectoryInfo]$script:TR_Live).GetFiles('*.json')) { $all[$fi.Name] = $fi } }
+    # a sidecar written just as its tab was moved or deleted elsewhere would linger; a tab still in last\ is mid-move
+    foreach ($n in @($all.Keys)) {
+        $tabName = $n -replace '\..*$', '.json'
+        if (-not $all.ContainsKey($tabName) -and -not [IO.File]::Exists((Join-Path $script:TR_Last $tabName))) {
+            Remove-Item -LiteralPath $all[$n].FullName -Force -ErrorAction SilentlyContinue; $all.Remove($n)
+        }
+    }
+    $snap = $null; $seen = @{}; $paths = @{}; $now = [DateTime]::UtcNow
+    foreach ($f in @($all.Values)) {
+        if ($f.Name -like '*.*.json') { continue }
+        $paths[$f.FullName] = 1
+        $o = $all[$f.BaseName + '.owner.json']
+        $stamp = "$($f.LastWriteTimeUtc.Ticks)|$($f.Length)|$(if ($o) { $o.LastWriteTimeUtc.Ticks })"
+        $c = $G.Tabs[$f.FullName]
+        $changed = -not $c -or $c.Stamp -ne $stamp
+        if ($changed) {
+            $active = $true
+            $c = @{ Stamp = $stamp; Tab = (Read-TRTab $f.FullName) }
+            if ($c.Tab) { $G.Tabs[$f.FullName] = $c } else { $G.Tabs.Remove($f.FullName) }   # unreadable: retried next loop
+        }
+        $tab = $c.Tab
+        if (-not $tab) { continue }
+        $spid = [int]$tab.shellPid
+        $seen[$spid] = 1
+        if ($changed) { $G.ReadAt[$spid] = $now }
+        if (Test-TRProcAlive $G $spid ([int64]$tab.shellStart)) {
+            $G.DeadSince.Remove($spid)
+            $G.Alive.Add($spid)
+            if ((Get-TRTabSession $tab) -ne $G.Session) { continue }
+            if ($changed -and -not $tab.wtPid) {
+                if (-not $snap) { $snap = Get-TRProcSnapshot $G }
+                try { Set-TRTabOwner $f.FullName $tab $snap.ById } catch { Write-TRLog "owner write $spid failed: $($_.Exception.Message)" }   # must not starve the rest of the loop
+            }
+            $runName = $f.BaseName + '.run.json'
+            $runPath = $f.DirectoryName + '\' + $runName      # no Join-Path: this runs for every tab on every loop
+            $child = $null
+            if ($tab.pendingCommand) {     # at a prompt nothing runs in the foreground: the hook clears pendingCommand there
+                $k = $G.Child[$spid]
+                if (-not $changed -and $k -and (Test-TRProcAlive $G $k.ProcessId $k.Start)) { $child = $k }
+                elseif (-not $changed -and $G.NextScan[$spid] -and $now -lt $G.NextScan[$spid]) { continue }
+                else {
+                    if (-not $snap) { $snap = Get-TRProcSnapshot $G }
+                    $child = Get-TRForegroundChild $G $snap $spid
+                }
+            }
+            $G.Child[$spid] = $child
+            if (-not $child) {
+                $G.NoChild[$spid] = 1 + [int]$G.NoChild[$spid]
+                # two consecutive empty loops: avoids deleting the run file while a dying WT takes children first
+                if ($G.NoChild[$spid] -lt 2) { $active = $true; continue }
+                if ($all.ContainsKey($runName)) {
+                    Remove-Item -LiteralPath $runPath -Force -ErrorAction SilentlyContinue
+                    $G.RunSig.Remove($spid); $G.RunKey.Remove($spid); $active = $true
+                }
+                # a long in-process command (a script, Start-Sleep) has no child: look again every 30 s or when the tab changes,
+                # but keep looking every loop for a while after the command was typed, as a slow program starts its child late
+                if (-not $tab.pendingCommand) { $G.NextScan.Remove($spid) }
+                elseif (($now - $G.ReadAt[$spid]).TotalSeconds -lt $G.QuickScanSec) { $G.NextScan.Remove($spid); $active = $true }
+                else { $G.NextScan[$spid] = $now.AddSeconds(30) }
+                continue
+            }
+            $G.NoChild[$spid] = 0; $G.NextScan.Remove($spid)
+            # /resume and /clear switch claude's session without a new process: its sessions file changes then
+            $sess = if ($child.Name -ieq 'claude.exe') { $G.Claude = $true; [IO.File]::GetLastWriteTimeUtc($G.SessionsDir + "\$($child.ProcessId).json").Ticks }
+            $key = "$($child.ProcessId)|$($child.Start)|$sess"
+            if ($G.RunKey[$spid] -ne $key -or -not $all.ContainsKey($runName)) {
+                $info = Get-TRRunInfo $child $spid
+                $sig = $info | ConvertTo-Json -Depth 6 -Compress
+                if ($G.RunSig[$spid] -ne $sig -or -not $all.ContainsKey($runName)) {
+                    $info['updatedAt'] = [DateTime]::UtcNow.ToString('o')
+                    Write-TRJson $runPath $info
+                    $G.RunSig[$spid] = $sig; $active = $true
+                }
+                $G.RunKey[$spid] = $key
+            }
+        } else {
+            $active = $true
+            if (-not $G.DeadSince.ContainsKey($spid)) { $G.DeadSince[$spid] = $now }
+            if (($now - $G.DeadSince[$spid]).TotalSeconds -ge $G.Grace) {
+                $r = Resolve-TRDeadTab $f $tab
+                Write-TRLog "shell $spid dead -> $r"
+                $G.Tabs.Remove($f.FullName); $seen.Remove($spid)
+            }
+        }
+    }
+    foreach ($k in @($G.Tabs.Keys)) { if (-not $paths.ContainsKey($k)) { $G.Tabs.Remove($k); $active = $true } }
+    foreach ($m in $G.DeadSince, $G.NoChild, $G.RunKey, $G.RunSig, $G.Child, $G.NextScan, $G.ReadAt) { foreach ($k in @($m.Keys)) { if (-not $seen.ContainsKey($k)) { $m.Remove($k) } } }
+    if ($active) { $G.Idle = 0 } else { $G.Idle++ }
+    $active
 }
 
 # Claude Code: keep the original flags, drop session selection / print / prompt, append --resume <id>.

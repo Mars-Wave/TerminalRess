@@ -10,7 +10,7 @@ function Get-TerminalRessStatus {
         if (-not $t) { continue }
         $run = Read-TRJson (Get-TRRunPath $f.FullName)
         [pscustomobject]@{
-            ShellPid = $t.shellPid; Alive = (Test-TRShellAlive $t $null); Cwd = $t.cwd
+            ShellPid = $t.shellPid; Alive = (Test-TRShellAlive $t); Cwd = $t.cwd
             Running  = if ($run) { $run.name } else { $null }
             Resume   = if ($run -and $run.resume) { $run.resume.sessionId } else { $null }
             Pending  = $t.pendingCommand; LastCommand = $t.lastCommand; Updated = $t.updatedAt

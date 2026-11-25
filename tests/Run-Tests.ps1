@@ -388,6 +388,63 @@ elseif (`$Mode -eq 'claude') {
     }
     Remove-Item (Join-Path $state 'config.json'); & $mod { $script:TR_ConfigCache = $null }
 
+    Section 'guardian loop: process snapshot, cached tab files, known child, idle back-off, wake-ups'
+    Reset-State; & $mod { Initialize-TRDirs }
+    $nat = & $mod {
+        Initialize-TRNativeProcs
+        $s = [TRNative.Procs]::Snapshot(); $me = [Diagnostics.Process]::GetCurrentProcess(); $p = $s.ById[[uint32]$PID]
+        $par = [int](Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
+        @(($p.ParentProcessId -eq $par), ($p.CreationDate -eq $me.StartTime), [TRNative.Procs]::IsAlive($PID, $me.StartTime.Ticks),
+          (-not [TRNative.Procs]::IsAlive($PID, $me.StartTime.AddMinutes(-1).Ticks)), (-not [TRNative.Procs]::IsAlive(99999999, 0)),
+          (@($s.Children($par) | Where-Object { $_.ProcessId -eq $PID }).Count -eq 1)) -join ','
+    }
+    Assert ($nat -eq 'True,True,True,True,True,True') "Toolhelp snapshot (parent, start time, children) and liveness with the PID-reuse guard: $nat"
+    $live = Join-Path $state 'live'
+    $enc = { param($c) '-NoProfile -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($c)) }
+    $sh = Start-Process $psExe -ArgumentList (& $enc "& '$work\claude.exe' /c ping -n 900 127.0.0.1 | Out-Null; Start-Sleep 900") -WindowStyle Hidden -PassThru
+    $cl = $null; $deadline = (Get-Date).AddSeconds(15)
+    while (-not $cl -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200; $cl = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($sh.Id) AND Name='claude.exe'" }
+    $sessFile = Join-Path $env:CLAUDE_CONFIG_DIR "sessions\$($cl.ProcessId).json"
+    [IO.File]::WriteAllText($sessFile, '{"sessionId":"aaaaaaaa-0000-0000-0000-00000000000a","cwd":"C:\\"}')
+    New-FakeTab $sh.Id $sh.StartTime.Ticks 'C:\' 'claude' $null $null $live
+    $runFile = Join-Path $live "$($sh.Id).run.json"
+    $G = & $mod { New-TRGuardianState }
+    $tick = { & $mod { param($g) Invoke-TRGuardianTick $g } $G }
+    $a1 = & $tick; $run = [IO.File]::ReadAllText($runFile) | ConvertFrom-Json
+    Assert ($a1 -and $G.Claude -and $run.name -eq 'claude.exe' -and $run.resume.sessionId -eq 'aaaaaaaa-0000-0000-0000-00000000000a') 'first loop: tab read, claude child found, run file written'
+    $quiet = @(1..5 | ForEach-Object { & $tick })
+    Assert ($quiet -notcontains $true -and $G.Idle -ge $G.IdleAfter -and $G.Idle -eq 5) "nothing changed: $($G.Idle) quiet loops in a row switch the guardian to the idle interval"
+    [IO.File]::WriteAllText($sessFile, '{"sessionId":"bbbbbbbb-0000-0000-0000-00000000000b","cwd":"C:\\"}')
+    $a2 = & $tick; $run = [IO.File]::ReadAllText($runFile) | ConvertFrom-Json
+    Assert ($a2 -and $G.Idle -eq 0 -and $run.resume.sessionId -eq 'bbbbbbbb-0000-0000-0000-00000000000b') '/resume or /clear (sessions file changed, same process) updates the run file on the next loop'
+    $ping = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($cl.ProcessId)"
+    Stop-Process -Id (@($ping.ProcessId) + $cl.ProcessId) -Force -ErrorAction SilentlyContinue; Wait-Process -Id $cl.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    $a3 = & $tick; $kept = Test-Path $runFile; $a4 = & $tick
+    Assert ($a3 -and $kept -and $a4 -and -not (Test-Path $runFile) -and -not $G.Claude) 'an ended program is noticed by PID without any file change; its run file goes after two empty loops'
+    Assert (-not $G.NextScan.ContainsKey($sh.Id) -and (& $tick)) 'shortly after a command was typed a tab without a child is looked at every loop (a slow program starts its child late)'
+    $G.ReadAt[$sh.Id] = [DateTime]::UtcNow.AddSeconds(-$G.QuickScanSec); $null = & $tick
+    Assert ($G.NextScan.ContainsKey($sh.Id) -and -not (& $tick)) 'a command running in-process (no child) is looked at again only every 30 s or when its tab changes'
+    New-FakeTab $sh.Id $sh.StartTime.Ticks 'C:\' $null 'x' $null $live
+    Assert ((& $tick) -and $G.Idle -eq 0 -and -not $G.NextScan.ContainsKey($sh.Id)) 'a changed tab file is read again and makes the loop active'
+    $fb = & $mod {
+        param($shPid) $g = New-TRGuardianState; $g.Native = $false
+        $s = Get-TRProcSnapshot $g; $me = [Diagnostics.Process]::GetCurrentProcess(); $par = [int]$s.ById[[uint32]$PID].ParentProcessId
+        @((Invoke-TRGuardianTick $g), $g.Alive.Contains($shPid), (Test-TRProcAlive $g $PID $me.StartTime.Ticks), (-not (Test-TRProcAlive $g $PID $me.StartTime.AddMinutes(-1).Ticks)),
+          (-not (Test-TRProcAlive $g 99999999 0)), (@($s.Children($par) | Where-Object { $_.ProcessId -eq $PID }).Count -eq 1), (@($s.Children(99999999)).Count -eq 0)) -join ','
+    } $sh.Id
+    Assert ($fb -eq 'True,True,True,True,True,True,True') "without the compiled helpers the loop falls back to Get-Process and a CIM snapshot: $fb"
+    $w = & $mod { param($d) New-Object TRNative.Waiter $d } $live
+    try {
+        $writeLater = { param($n) Start-Process $psExe -ArgumentList (& $enc "Start-Sleep -Milliseconds 400; [IO.File]::WriteAllText('$live\$n', '{}')") -WindowStyle Hidden }
+        & $writeLater "$($sh.Id).run.json"; $r0 = $w.Wait(2500, [int[]]@())
+        & $writeLater '77.json'; $sw = [Diagnostics.Stopwatch]::StartNew(); $r1 = $w.Wait(15000, [int[]]@()); $t1 = $sw.Elapsed.TotalSeconds
+        $w.Reset()
+        $q = Start-Process $psExe -ArgumentList '-NoProfile -Command Start-Sleep 1' -WindowStyle Hidden -PassThru
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $r2 = $w.Wait(15000, [int[]]@($sh.Id, $q.Id)); $t2 = $sw.Elapsed.TotalSeconds
+        Assert ($r0 -eq 0 -and $r1 -eq 1 -and $t1 -lt 10 -and $r2 -eq 2 -and $t2 -lt 10) "wait: the guardian's own sidecar writes do not wake it, a tab file change and a shell exit do ($r0/$r1/$r2)"
+    } finally { $w.Dispose() }
+    Stop-Process -Id $sh.Id -Force -ErrorAction SilentlyContinue
+
     Section 'restore-tab: baseline -> env -> RESTORING profile -> cwd -> command'
     Reset-State; & $mod { Initialize-TRDirs }
     $fprof = Join-Path $work 'fakeprofile.ps1'
