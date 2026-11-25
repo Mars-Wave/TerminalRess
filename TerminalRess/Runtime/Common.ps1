@@ -68,11 +68,15 @@ function Write-TRLog([string]$Message) {
         [IO.File]::AppendAllText($log, ("{0:s} {1}`r`n" -f (Get-Date), $Message), $script:TR_Utf8)
     } catch { }
 }
-function Get-TRHash([string]$s) {
-    $md5 = [Security.Cryptography.MD5]::Create()
-    (($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($s.ToLowerInvariant())) | Select-Object -First 4 | ForEach-Object { $_.ToString('x2') }) -join '')
+function Get-TRHash([string]$s, [switch]$Md5) {
+    # MD5 throws under the Windows FIPS policy (so does SHA256Managed on .NET Framework < 4.8); the CSP class is FIPS-validated.
+    # -Md5 only rebuilds the pre-SHA256 mutex names.
+    if ($Md5) { $h = [Security.Cryptography.MD5]::Create() }
+    else { $h = try { New-Object Security.Cryptography.SHA256CryptoServiceProvider } catch { [Security.Cryptography.SHA256]::Create() } }
+    try { (($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($s.ToLowerInvariant())) | Select-Object -First 4 | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $h.Dispose() }
 }
-function Get-TRMutexName([string]$Kind) { "Local\TerminalRess-$Kind-" + (Get-TRHash $script:TR_State) }
+function Get-TRMutexName([string]$Kind, [switch]$Legacy) { "Local\TerminalRess-$Kind-" + (Get-TRHash $script:TR_State -Md5:$Legacy) }
 function Get-TRSessionId { [Diagnostics.Process]::GetCurrentProcess().SessionId }
 function Get-TRRuntimeDir {
     if (Test-Path -LiteralPath (Join-Path $script:TR_InstalledRuntime 'guardian.ps1')) { $script:TR_InstalledRuntime } else { $script:TR_Runtime }
@@ -207,12 +211,16 @@ function Get-TRWtPath($Owner) {
     }
     $null
 }
-function Test-TRGuardianRunning {
+function Test-TRMutexExists([string]$Name) {
     $m = $null
-    $r = [Threading.Mutex]::TryOpenExisting((Get-TRMutexName 'Guardian'), [ref]$m)
+    $r = [Threading.Mutex]::TryOpenExisting($Name, [ref]$m)
     if ($m) { $m.Dispose() }
     $r
 }
+# A guardian started before an upgrade keeps its MD5-named mutex until it exits; without this a second one would start.
+# Under FIPS MD5 throws, but then no old guardian can have run either.
+function Test-TRLegacyGuardian { try { Test-TRMutexExists (Get-TRMutexName 'Guardian' -Legacy) } catch { $false } }
+function Test-TRGuardianRunning { (Test-TRMutexExists (Get-TRMutexName 'Guardian')) -or (Test-TRLegacyGuardian) }
 function Start-TRGuardianProcess {
     if (Test-TRGuardianRunning) { return $false }
     Initialize-TRDirs

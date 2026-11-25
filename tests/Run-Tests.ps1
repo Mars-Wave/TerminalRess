@@ -52,6 +52,23 @@ try {
     $q = & $mod { (ConvertTo-TRWtArg 'C:\a b\c;d\') + '|' + (ConvertTo-TRWtArg 'Z:\o e\') + '|' + (ConvertTo-TRWtArg 'plain') }
     Assert ($q -eq '"C:\a b\c\;d\\"|"Z:\o e\\"|plain') "quoting: $q"
 
+    Section 'mutex names: FIPS-safe hash + legacy guardian'
+    $hs = & $mod { (Get-TRHash 'abc') + '|' + (Get-TRHash 'ABC') + '|' + (Get-TRHash 'abc' -Md5) }
+    Assert ($hs -eq 'ba7816bf|ba7816bf|90015098') "SHA256 prefix, case-insensitive, legacy MD5 kept for the old name: $hs"
+    $names = & $mod { @((Get-TRMutexName 'Guardian'), (Get-TRMutexName 'Guardian' -Legacy)) }
+    Assert ($names[0] -match '^Local\\TerminalRess-Guardian-[0-9a-f]{8}$' -and $names[0] -ne $names[1]) "guardian mutex name: $($names[0])"
+    Assert (-not (& $mod { Test-TRGuardianRunning })) 'no guardian running for the test state dir'
+    $legacy = New-Object Threading.Mutex($false, $names[1])
+    try {
+        Assert (& $mod { Test-TRGuardianRunning }) 'a pre-upgrade guardian (MD5-named mutex) counts as running'
+        & $psExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $modDir 'Runtime\guardian.ps1') -Once | Out-Null
+        $glog = Join-Path $state 'guardian.log'
+        Assert (-not ((Test-Path $glog) -and ((Get-Content $glog -Raw) -match 'guardian started'))) 'a new guardian does not start beside a pre-upgrade one'
+    } finally { $legacy.Dispose() }
+    Assert (-not (& $mod { Test-TRGuardianRunning })) 'legacy mutex released'
+    & $psExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $modDir 'Runtime\guardian.ps1') -Once | Out-Null
+    Assert ((Test-Path $glog) -and ((Get-Content $glog -Raw) -match 'guardian started')) 'control: guardian starts once the legacy mutex is gone'
+
     Section 'claude resume handler (fake sessions dir)'
     $sdir = Join-Path $env:CLAUDE_CONFIG_DIR 'sessions'
     '{"pid":4242,"sessionId":"11111111-1111-1111-1111-111111111111","cwd":"C:\\Work\\p\u00e1gina","kind":"interactive"}' | Set-Content (Join-Path $sdir '4242.json') -Encoding UTF8

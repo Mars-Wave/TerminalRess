@@ -7,7 +7,7 @@ Initialize-TRDirs
 
 $created = $false
 $mutex = New-Object Threading.Mutex($false, (Get-TRMutexName 'Guardian'), [ref]$created)
-if (-not $created) { exit 0 }
+if (-not $created -or (Test-TRLegacyGuardian)) { exit 0 }
 [IO.File]::WriteAllText((Join-Path $TR_State 'guardian.pid'), [string]$PID, $TR_Utf8)
 
 $cfg = Get-TRConfig
