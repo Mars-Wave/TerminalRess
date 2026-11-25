@@ -4,6 +4,7 @@
 [![PowerShell Gallery](https://img.shields.io/powershellgallery/v/TerminalRess)](https://www.powershellgallery.com/packages/TerminalRess)
 ![Platform: Windows only](https://img.shields.io/badge/platform-Windows%20only-0078D6)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-db61a2?logo=githubsponsors)](https://github.com/sponsors/Mars-Wave)
 
 Brings your Windows Terminal tabs back after the terminal goes away: close-all, crash, force-kill, logoff, reboot or power loss.
 Windows only (Windows Terminal + Windows PowerShell 5.1 or PowerShell 7).
