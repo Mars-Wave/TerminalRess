@@ -1,5 +1,5 @@
 # Run at logon by the Startup shortcut (through startup.vbs, hidden): start the guardian and, if a previous
-# generation is waiting in last\, launch Windows Terminal. Its first tab restores everything (see tab-hook.ps1).
+# generation is waiting in last\, launch Windows Terminal. Its first tab restores everything (see pre-adopt.ps1).
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Common.ps1')
 Initialize-TRDirs

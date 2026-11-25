@@ -4,8 +4,7 @@
 # ASCII only: PowerShell 5.1 reads BOM-less files as ANSI.
 
 $script:TR_Runtime = $PSScriptRoot
-$script:TR_Home    = if ($env:TERMINALRESS_STATE) { $env:TERMINALRESS_STATE } else { Join-Path $env:LOCALAPPDATA 'TerminalRess' }
-$script:TR_State   = $script:TR_Home
+$script:TR_State   = if ($env:TERMINALRESS_STATE) { $env:TERMINALRESS_STATE } else { Join-Path $env:LOCALAPPDATA 'TerminalRess' }
 $script:TR_Live    = Join-Path $script:TR_State 'live'
 $script:TR_Last    = Join-Path $script:TR_State 'last'
 $script:TR_Archive = Join-Path $script:TR_State 'archive'
@@ -61,6 +60,7 @@ function Write-TRJson([string]$Path, $Obj) {
     [IO.File]::WriteAllText($tmp, ($Obj | ConvertTo-Json -Depth 6 -Compress), $script:TR_Utf8)
     Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
+function Write-TRJsonPretty([string]$Path, $Obj) { [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 6), $script:TR_Utf8) }
 function Write-TRLog([string]$Message) {
     try {
         $log = Join-Path $script:TR_State 'guardian.log'
@@ -335,13 +335,11 @@ function Get-TRLastTabs {
     }
     @($tabs | Sort-Object { [int64]$_.Tab.shellStart })
 }
-function Move-TRLastToArchive {
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
-    $arch = Join-Path $script:TR_Archive $stamp
-    New-Item -ItemType Directory -Force -Path $arch | Out-Null
-    Get-ChildItem -LiteralPath $script:TR_Last -File -ErrorAction SilentlyContinue | Move-Item -Destination $arch -Force -ErrorAction SilentlyContinue
+# Moves last\ into archive\<Dir> (keeps the 5 newest generations).
+function Move-TRLastToArchive([string]$Dir) {
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    Get-ChildItem -LiteralPath $script:TR_Last -File -ErrorAction SilentlyContinue | Move-Item -Destination $Dir -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $script:TR_Archive -Directory | Sort-Object Name -Descending | Select-Object -Skip 5 | ForEach-Object { [IO.Directory]::Delete($_.FullName, $true) }
-    $arch
 }
 function Enter-TRRestoreLock {
     $created = $false
@@ -350,7 +348,20 @@ function Enter-TRRestoreLock {
     $m.Dispose(); $null
 }
 
-# Restore everything into ONE NEW window (Restore-TerminalRess). -DryRun returns the wt arguments.
+# Opens every tab of last\ (original order) in window $Window ('new' or '0'). last\ is archived BEFORE spawning, so
+# restored tabs never re-trigger. Caller holds the restore lock. Returns the tab count (or, with -DryRun, the wt command line).
+function Start-TRSavedTabs([string]$Wt, [string]$Window, [switch]$DryRun) {
+    $tabs = Get-TRLastTabs
+    if ($tabs.Count -eq 0) { return $null }
+    $arch = Join-Path $script:TR_Archive (Get-Date -Format 'yyyyMMdd-HHmmssfff')
+    $wtArgs = "-w $Window " + (@($tabs | ForEach-Object { New-TRTabArgs $_.Tab (Join-Path $arch $_.File.Name) }) -join ' ; ')
+    if ($DryRun) { return "$Wt $wtArgs" }
+    Move-TRLastToArchive $arch
+    Start-TRProcess $Wt $wtArgs
+    $tabs.Count
+}
+
+# Restore-TerminalRess: everything into ONE NEW window.
 function Invoke-TRRestoreAll([switch]$DryRun) {
     Initialize-TRDirs
     $wt = Get-TRWtPath
@@ -358,23 +369,14 @@ function Invoke-TRRestoreAll([switch]$DryRun) {
     $lock = Enter-TRRestoreLock
     if (-not $lock) { return 'restore already running' }
     try {
-        $tabs = Get-TRLastTabs
-        if ($tabs.Count -eq 0) { return $null }
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
-        $archName = Join-Path $script:TR_Archive $stamp
-        $parts = foreach ($t in $tabs) { New-TRTabArgs $t.Tab (Join-Path $archName $t.File.Name) }
-        $wtArgs = '-w new ' + ($parts -join ' ; ')
-        if ($DryRun) { return "$wt $wtArgs" }
-        $arch = Move-TRLastToArchive
-        $wtArgs = $wtArgs.Replace($archName, $arch)
-        Start-TRProcess $wt $wtArgs
-        return "restored $($tabs.Count) tab(s)"
+        $r = Start-TRSavedTabs $wt 'new' -DryRun:$DryRun
+        if ($null -eq $r -or $DryRun) { return $r }
+        "restored $r tab(s)"
     } finally { try { $lock.ReleaseMutex() } catch { } }
 }
 
-# Called by pre-adopt.ps1 in a freshly started launcher shell: if a saved generation exists and nothing else is tracked, take
-# the lock, archive last\ and open ALL saved tabs (original order) in the launcher's window. Returns the number of tabs
-# spawned, or 0 when there was nothing to do (the caller then continues as a normal shell).
+# Called by pre-adopt.ps1 in a freshly started launcher shell: if a saved generation exists and nothing else is tracked, open
+# ALL saved tabs in the launcher's window. Returns the number of tabs spawned, or 0 (the caller then continues as a normal shell).
 function Invoke-TRSpawnAll($Owner) {
     if ((Get-TRTabFiles $script:TR_Last).Count -eq 0) { Invoke-TRSweep; if ((Get-TRTabFiles $script:TR_Last).Count -eq 0) { return 0 } }
     if (@(Get-TRLiveAliveTabs $PID).Count -gt 0) { return 0 }
@@ -382,16 +384,7 @@ function Invoke-TRSpawnAll($Owner) {
     if (-not $wt) { return 0 }
     $lock = Enter-TRRestoreLock
     if (-not $lock) { return 0 }
-    try {
-        $tabs = Get-TRLastTabs
-        if ($tabs.Count -eq 0) { return 0 }
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
-        $archName = Join-Path $script:TR_Archive $stamp
-        $wtArgs = '-w 0 ' + ((@($tabs | ForEach-Object { New-TRTabArgs $_.Tab (Join-Path $archName $_.File.Name) })) -join ' ; ')
-        $arch = Move-TRLastToArchive               # archive BEFORE spawning: restored tabs must never re-trigger
-        Start-TRProcess $wt ($wtArgs.Replace($archName, $arch))
-        $tabs.Count
-    } finally { try { $lock.ReleaseMutex() } catch { } }
+    try { [int](Start-TRSavedTabs $wt '0') } finally { try { $lock.ReleaseMutex() } catch { } }
 }
 
 # ---------------------------------------------------------------- applying a saved tab

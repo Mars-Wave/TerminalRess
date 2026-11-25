@@ -10,7 +10,6 @@ $wt = & (Get-Module TerminalRess) { Get-TRWtPath }
 $dir = Join-Path $env:LOCALAPPDATA ("Temp\TR-e2e-dir $([char]0xe1)")
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $psx = 'powershell.exe'
-$t1 = "new-tab $psx -NoExit -Command `"# --skip-vcvars`" ; "
 # tab commands are typed through -Command so the hook (profile) loads normally
 $cmd = @(
     "-w new new-tab -d `"$dir`" $psx -NoExit -Command `"`$env:E2E_VAR='custom-value'; Set-Location '$dir'; # --skip-vcvars`"",

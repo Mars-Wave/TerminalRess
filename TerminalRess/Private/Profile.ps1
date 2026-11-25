@@ -8,7 +8,7 @@ $script:TR_MainEnd   = '# <<< TerminalRess <<<'
 function Get-TRPreBlock {
     @($script:TR_PreBegin,
       '# Captures the environment this shell started with (before the profile changes it) and, only when a saved',
-      '# tab generation is waiting, claims saved tab #1 for this shell before the rest of the profile runs. Managed by TerminalRess.',
+      '# tab generation is waiting, reopens all saved tabs and closes this launcher tab. Managed by TerminalRess.',
       'if ($env:WT_SESSION -and -not $global:TerminalRessBaseline) {',
       '    $global:TerminalRessBaseline = [Environment]::GetEnvironmentVariables(''Process'')',
       '    $trS = if ($env:TERMINALRESS_STATE) { $env:TERMINALRESS_STATE } else { Join-Path $env:LOCALAPPDATA ''TerminalRess'' }',

@@ -75,7 +75,3 @@ function Install-TerminalRess {
         Note            = 'New terminals pick the hooks up; tabs already open are not tracked until reopened.'
     }
 }
-
-function Write-TRJsonPretty([string]$Path, $Obj) {
-    [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding $false))
-}
