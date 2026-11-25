@@ -38,7 +38,7 @@ foreach ($rtN in $rtPe.Keys) {
 # 4. working directory, 5. command
 if ($rtTab.cwd -and (Test-Path -LiteralPath $rtTab.cwd -PathType Container)) { Set-Location -LiteralPath $rtTab.cwd }
 if ($rtTab.lastCommand -and $global:__TR) { $global:__TR.LastCommand = [string]$rtTab.lastCommand }
-$rtAct = Get-TRTabAction $rtTab $rtRun $rtCfg
+$rtAct = Resolve-TRClaudeAction (Get-TRTabAction $rtTab $rtRun $rtCfg) $rtRun
 if ($rtAct) { . $global:TRRunAction $rtAct }
 else { if (Get-Command TR_MarkRunning -ErrorAction SilentlyContinue) { try { TR_Snapshot; TR_WriteState } catch { } } }
 Remove-Variable rtTab, rtRun, rtCfg, rtProfiles, rtP, rtAct, rtPe, rtEntries, rtE, rtN, TabFile -ErrorAction SilentlyContinue

@@ -35,7 +35,8 @@ function New-FakeTab($Pid_, $Start, $Cwd, $Pending, $Last, $Env, [string]$Dir, $
 try {
     Section 'manifest + import'
     $m = Test-ModuleManifest (Join-Path $modDir 'TerminalRess.psd1')
-    Assert ($m.Version -eq [version]'1.0.0') 'manifest valid'
+    $mv = $m.Version.ToString()
+    Assert ($m.Version -ge [version]'1.0.0') 'manifest valid'
     Import-Module (Join-Path $modDir 'TerminalRess.psd1') -Force
     $exported = (Get-Command -Module TerminalRess).Name | Sort-Object
     Assert ($exported.Count -eq 7) "7 public commands: $($exported -join ', ')"
@@ -91,6 +92,40 @@ try {
     Assert ($res -and $res.exe -eq 'C:\c\codex.exe' -and ($res.args -join ' ') -eq 'resume --last') 'config-defined resume handler'
     Assert ($null -eq (& $mod { Get-TRResumeCommand ([pscustomobject]@{ ProcessId = 1; Name = 'ping.exe'; ExecutablePath = 'x' }) @('x') })) 'no handler for other programs'
     Remove-Item (Join-Path $state 'config.json'); & $mod { $script:TR_ConfigCache = $null }
+
+    Section 'claude background sessions (continued-in chain, attach vs resume)'
+    $proj = Join-Path $work 'claude\projects\G--x'
+    New-Item -ItemType Directory -Force -Path $proj | Out-Null
+    $sA = 'aaaaaaaa-0000-0000-0000-00000000000a'; $sB = 'bbbbbbbb-0000-0000-0000-00000000000b'; $sC = 'cccccccc-0000-0000-0000-00000000000c'
+    $u8 = New-Object Text.UTF8Encoding $false
+    [IO.File]::WriteAllText((Join-Path $proj "$sA.jsonl"), ('{"type":"user","message":{}}' + "`n" + '{"type":"cost-state"}' + "`n" + "{`"type`":`"continued-in`",`"sessionId`":`"$sA`",`"continuedInSessionId`":`"$sB`"}" + "`n"), $u8)
+    [IO.File]::WriteAllText((Join-Path $proj "$sB.jsonl"), '{"type":"assistant","message":{}}' + "`n", $u8)
+    Assert ((& $mod { param($s) Get-TRClaudeContinuation $s } $sA) -eq $sB) 'continued-in record followed to the background session'
+    Assert ((& $mod { param($s) Get-TRClaudeContinuation $s } $sB) -eq $sB) 'session without continuation stays'
+    [IO.File]::WriteAllText((Join-Path $proj "$sC.jsonl"), ("{`"type`":`"continued-in`",`"continuedInSessionId`":`"$sB`"}" + "`n" + '{"type":"user","message":{}}' + "`n"), $u8)
+    Assert ((& $mod { param($s) Get-TRClaudeContinuation $s } $sC) -eq $sC) 'continued-in followed by more messages (session used again) is ignored'
+    $runA = [pscustomobject]@{ argv = @('C:\x\claude.exe', '--dangerously-skip-permissions', '--resume', $sA); resume = [pscustomobject]@{ handler = 'claude'; sessionId = $sA } }
+    $actA = @{ Kind = 'Resume'; Exe = 'C:\x\claude.exe'; Args = [string[]]@('--dangerously-skip-permissions', '--resume', $sA); Cwd = 'C:\w' }
+    $bgLive = { param($all) @([pscustomobject]@{ id = 'bbbbbbbb'; sessionId = 'bbbbbbbb-0000-0000-0000-00000000000b'; kind = 'background'; name = 'IA' }) }
+    $bgNone = { param($all) @() }
+    $r = & $mod { param($a, $r, $f) Resolve-TRClaudeAction $a $r -AgentsFn $f } $actA $runA $bgLive
+    Assert (($r.Args -join ' ') -eq 'attach bbbbbbbb' -and $r.Cwd -eq 'C:\w') "handed-off session still running in the daemon: attach ($($r.Args -join ' '))"
+    $r = & $mod { param($a, $r, $f) Resolve-TRClaudeAction $a $r -AgentsFn $f } $actA $runA $bgNone
+    Assert (($r.Args -join ' ') -eq "--dangerously-skip-permissions --resume $sB") "daemon gone: resume the continued session with the original flags ($($r.Args -join ' '))"
+    $runB = [pscustomobject]@{ argv = @('C:\x\claude.exe', '--resume', $sB); resume = [pscustomobject]@{ handler = 'claude'; sessionId = $sB } }
+    $actB = @{ Kind = 'Resume'; Exe = 'C:\x\claude.exe'; Args = [string[]]@('--resume', $sB); Cwd = $null }
+    $called = $false
+    $r = & $mod { param($a, $r, $f) Resolve-TRClaudeAction $a $r -AgentsFn $f } $actB $runB { param($all) $script:called = $true; @() }
+    Assert ((($r.Args -join ' ') -eq "--resume $sB") -and -not $called) 'ordinary foreground session: unchanged, claude not asked'
+    $runT = [pscustomobject]@{ argv = @('C:\x\claude.exe', 'attach', 'bbbbbbbb'); resume = [pscustomobject]@{ handler = 'claude'; sessionId = $null } }
+    $actT = @{ Kind = 'Resume'; Exe = 'C:\x\claude.exe'; Args = [string[]]@('attach', 'bbbbbbbb'); Cwd = $null }
+    $r = & $mod { param($a, $r, $f) Resolve-TRClaudeAction $a $r -AgentsFn $f } $actT $runT $bgLive
+    Assert (($r.Args -join ' ') -eq 'attach bbbbbbbb') 'tab running `claude attach`: attaches again while the session runs'
+    $bgDone = { param($all) if ($all) { @([pscustomobject]@{ id = 'bbbbbbbb'; sessionId = 'bbbbbbbb-0000-0000-0000-00000000000b'; kind = 'background' }) } else { @() } }
+    $r = & $mod { param($a, $r, $f) Resolve-TRClaudeAction $a $r -AgentsFn $f } $actT $runT $bgDone
+    Assert (($r.Args -join ' ') -eq "--resume $sB") "attached session finished: resumed by its full id ($($r.Args -join ' '))"
+    $r = & $mod { param($a, $r, $f) Resolve-TRClaudeAction $a $r -AgentsFn $f } @{ Kind = 'Pretype'; Text = 'x' } $runA $bgLive
+    Assert ($r.Kind -eq 'Pretype') 'non-resume actions pass through'
 
     Section 'tab action selection (replay allowlist)'
     $act = & $mod {
@@ -515,19 +550,19 @@ elseif (`$Mode -eq 'claude') {
     Assert (-not (Test-Path $rt)) 'module import with TerminalRess not installed creates no runtime'
     Assert (-not (& $mod { Update-TRRuntime $TR_ModuleRoot }) -and -not (Test-Path $rt)) 'not installed: update is a no-op and creates nothing'
     $st = Get-TerminalRessStatus
-    Assert ($st.ModuleVersion -eq [version]'1.0.0' -and $null -eq $st.RuntimeVersion) "status: module $($st.ModuleVersion), no runtime"
+    Assert ($st.ModuleVersion -eq [version]$mv -and $null -eq $st.RuntimeVersion) "status: module $($st.ModuleVersion), no runtime"
     New-Item -ItemType Directory -Force -Path $rt | Out-Null
     'old' | Set-Content (Join-Path $rt 'tab-hook.ps1')
     Assert (& $mod { Update-TRRuntime $TR_ModuleRoot }) 'unstamped (pre-version.txt) runtime is updated'
     '0.9.0' | Set-Content (Join-Path $rt 'version.txt'); 'old' | Set-Content (Join-Path $rt 'tab-hook.ps1')
     Assert (& $mod { Update-TRRuntime $TR_ModuleRoot }) 'older runtime: updated'
     Assert ([IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook -and (Test-Path (Join-Path $rt 'guardian.ps1')) -and (Test-Path (Join-Path $rt 'Base.ps1'))) 'runtime files replaced by the module copy (new files added)'
-    Assert ((Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq '1.0.0' -and (Get-TerminalRessStatus).RuntimeVersion -eq [version]'1.0.0') 'runtime stamped with the module version (status shows it)'
+    Assert ((Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq $mv -and (Get-TerminalRessStatus).RuntimeVersion -eq [version]$mv) 'runtime stamped with the module version (status shows it)'
     Assert (@(Get-ChildItem $rt -Filter '*.tmp').Count -eq 0) 'no staging files left behind'
-    foreach ($v in '1.0.0', '2.0.0') {
+    foreach ($v in $mv, '9.0.0') {
         $v | Set-Content (Join-Path $rt 'version.txt'); 'local' | Set-Content (Join-Path $rt 'tab-hook.ps1')
         $u = & $mod { Update-TRRuntime $TR_ModuleRoot }
-        Assert (-not $u -and (Get-Content (Join-Path $rt 'tab-hook.ps1') -Raw).Trim() -eq 'local' -and (Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq $v) "runtime $v vs module 1.0.0: untouched"
+        Assert (-not $u -and (Get-Content (Join-Path $rt 'tab-hook.ps1') -Raw).Trim() -eq 'local' -and (Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq $v) "runtime $v vs module ${mv}: untouched"
     }
 
     $roots = Join-Path $work 'modroots'
@@ -546,7 +581,7 @@ elseif (`$Mode -eq 'claude') {
     Reset-State
     '0.9.0' | Set-Content (Join-Path $rt 'version.txt'); 'old' | Set-Content (Join-Path $rt 'tab-hook.ps1')
     $o = Invoke-ChildShell "Import-Module '$(Join-Path $modDir 'TerminalRess.psd1')'; 'IMPORTED'"
-    Assert ($o -match 'IMPORTED' -and (Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq '1.0.0' -and [IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook) 'module import upgrades an older installed runtime'
+    Assert ($o -match 'IMPORTED' -and (Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq $mv -and [IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook) 'module import upgrades an older installed runtime'
 
     # a guardian running from an older installed runtime finds the newer module, updates the runtime and restarts itself
     Reset-State
@@ -557,8 +592,8 @@ elseif (`$Mode -eq 'claude') {
     finally { Remove-Item Env:\TERMINALRESS_MODULEROOTS }
     $glog = Get-Content (Join-Path $state 'guardian.log') -Raw
     $dry = Get-Content (Join-Path $state 'dryrun.log') -Raw -ErrorAction SilentlyContinue
-    Assert ((Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq '1.0.0' -and [IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook) 'guardian updates an older installed runtime from the newest module'
-    Assert ($glog -match 'guardian restarting on runtime 1\.0\.0' -and $dry -like "*$(Join-Path $rt 'guardian.ps1')*") 'guardian exits and relaunches itself on the new runtime'
+    Assert ((Get-Content (Join-Path $rt 'version.txt') -Raw).Trim() -eq $mv -and [IO.File]::ReadAllText((Join-Path $rt 'tab-hook.ps1')) -ceq $srcHook) 'guardian updates an older installed runtime from the newest module'
+    Assert ($glog -match "guardian restarting on runtime $([regex]::Escape($mv))" -and $dry -like "*$(Join-Path $rt 'guardian.ps1')*") 'guardian exits and relaunches itself on the new runtime'
     Assert (-not (Test-Path (Join-Path $state 'guardian.pid')) -and -not (& $mod { Test-TRGuardianRunning })) 'old guardian released its mutex and pid file'
 }
 finally {

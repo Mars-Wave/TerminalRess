@@ -1,6 +1,6 @@
 @{
     RootModule           = 'TerminalRess.psm1'
-    ModuleVersion        = '1.0.0'
+    ModuleVersion        = '1.0.1'
     GUID                 = '341530b1-3443-4f88-9201-05e77c6684d2'
     Author               = 'Mars-Wave'
     Copyright            = '(c) 2026 Mars-Wave. MIT License.'

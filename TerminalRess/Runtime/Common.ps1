@@ -580,6 +580,76 @@ function Get-TRClaudeResume($Child, [string[]]$Argv) {
     $rargs = if ($sid) { ConvertTo-TRClaudeResumeArgs $Argv $sid } elseif ($Argv.Count -gt 1) { [string[]]$Argv[1..($Argv.Count - 1)] } else { @() }
     [ordered]@{ handler = 'claude'; exe = $Child.ExecutablePath; args = @($rargs); cwd = $cwd; sessionId = $sid }
 }
+function Get-TRClaudeProjectsDir {
+    $base = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+    Join-Path $base 'projects'
+}
+# A session handed to Claude's background daemon goes on under a new id: its transcript ends with a continued-in record.
+# Follows that chain; a record followed by more messages (the old session was used again) does not count.
+function Get-TRClaudeContinuation([string]$SessionId, [string]$ProjectsDir = (Get-TRClaudeProjectsDir)) {
+    if (-not [IO.Directory]::Exists($ProjectsDir)) { return $SessionId }
+    $seen = @{}
+    while ($SessionId -and -not $seen.ContainsKey($SessionId) -and $seen.Count -lt 8) {
+        $seen[$SessionId] = 1
+        $file = $null
+        foreach ($d in [IO.Directory]::GetDirectories($ProjectsDir)) { $p = Join-Path $d "$SessionId.jsonl"; if ([IO.File]::Exists($p)) { $file = $p; break } }
+        if (-not $file) { break }
+        $next = $null
+        try {
+            $fs = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+            try {
+                $fs.Seek([Math]::Max(0, $fs.Length - 65536), 'Begin') | Out-Null
+                $lines = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd() -split "`n"
+            } finally { $fs.Dispose() }
+            for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+                $l = $lines[$i]
+                if ($l -match '"type":"(user|assistant)"') { break }
+                if ($l -match '"type":"continued-in"' -and $l -match '"continuedInSessionId":"([0-9a-fA-F-]{36})"') { $next = $Matches[1]; break }
+            }
+        } catch { }
+        if (-not $next) { break }
+        $SessionId = $next
+    }
+    $SessionId
+}
+# Live Claude sessions as reported by `claude agents --json` (documented; --all adds finished background ones). $null on failure.
+function Get-TRClaudeAgents([string]$Exe, [switch]$All) {
+    try {
+        $a = @('agents', '--json'); if ($All) { $a += '--all' }
+        $out = & $Exe @a 2>$null | Out-String
+        if ($LASTEXITCODE -ne 0 -or -not $out.Trim()) { return $null }
+        @($out | ConvertFrom-Json | ForEach-Object { $_ })
+    } catch { $null }
+}
+# Restore-time fix-up of a claude Resume action for sessions living in the background daemon:
+#   - the tab ran `claude --resume X` and X was later moved to the background (now Y): attach to Y if it is still running,
+#     otherwise resume Y with the original flags;
+#   - the tab ran `claude attach Y`: attach again if Y is still running, otherwise resume Y's session.
+# $AgentsFn (tests) returns the agent list for a [bool] "all" argument.
+function Resolve-TRClaudeAction($Act, $Run, [string]$ProjectsDir = (Get-TRClaudeProjectsDir), [scriptblock]$AgentsFn) {
+    if (-not $Act -or $Act.Kind -ne 'Resume' -or -not $Run -or -not $Run.resume -or $Run.resume.handler -ne 'claude') { return $Act }
+    if (-not $AgentsFn) { $exe = $Act.Exe; $AgentsFn = { param($all) Get-TRClaudeAgents $exe -All:$all }.GetNewClosure() }
+    $argv = [string[]]@($Run.argv)
+    $attach = if ($argv.Count -ge 3 -and $argv[1] -eq 'attach') { $argv[2] } else { $null }
+    $sid = [string]$Run.resume.sessionId
+    if (-not $attach) {
+        if (-not $sid) { return $Act }
+        $sid = Get-TRClaudeContinuation $sid $ProjectsDir
+        if ($sid -eq $Run.resume.sessionId) { return $Act }   # an ordinary foreground session: nothing to ask claude
+    }
+    $match = { param($e) if ($attach) { $e.id -eq $attach -or $e.name -eq $attach -or ([string]$e.sessionId).StartsWith($attach) } else { $e.sessionId -eq $sid } }
+    $live = @(& $AgentsFn $false | Where-Object { $_ -and $_.kind -eq 'background' -and (& $match $_) })
+    if ($live.Count) {
+        $target = if ($live[0].id) { [string]$live[0].id } else { [string]$live[0].sessionId }
+        return @{ Kind = 'Resume'; Exe = $Act.Exe; Args = [string[]]@('attach', $target); Cwd = $Act.Cwd }
+    }
+    if ($attach) {
+        $done = @(& $AgentsFn $true | Where-Object { $_ -and (& $match $_) })
+        if (-not $done.Count -or -not $done[0].sessionId) { return $Act }   # unknown: let `claude attach` say so
+        $sid = [string]$done[0].sessionId
+    }
+    @{ Kind = 'Resume'; Exe = $Act.Exe; Args = (ConvertTo-TRClaudeResumeArgs $argv $sid); Cwd = $Act.Cwd }
+}
 # Handler registry: built-in claude + config.resumeHandlers entries
 #   { "exe": "codex.exe", "command": ["{exe}", "resume", "--last"] }   ({argv} expands to the original arguments)
 function Get-TRResumeCommand($Child, [string[]]$Argv) {
