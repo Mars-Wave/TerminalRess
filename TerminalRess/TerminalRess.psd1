@@ -3,7 +3,7 @@
     ModuleVersion        = '1.0.1'
     GUID                 = '341530b1-3443-4f88-9201-05e77c6684d2'
     Author               = 'Mars-Wave'
-    Copyright            = '(c) 2026 Mars-Wave. MIT License.'
+    Copyright            = '(c) 2026 Mars-Wave. Apache License 2.0.'
     Description          = 'Windows only. Brings Windows Terminal tabs back after a crash, kill, logoff or reboot: same directory, environment and foreground command (Claude Code sessions are resumed).'
     PowerShellVersion    = '5.1'
     CompatiblePSEditions = @('Desktop', 'Core')

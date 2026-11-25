@@ -3,6 +3,7 @@
 [![CI](https://github.com/Mars-Wave/TerminalRess/actions/workflows/ci.yml/badge.svg)](https://github.com/Mars-Wave/TerminalRess/actions/workflows/ci.yml)
 [![PowerShell Gallery](https://img.shields.io/powershellgallery/v/TerminalRess)](https://www.powershellgallery.com/packages/TerminalRess)
 ![Platform: Windows only](https://img.shields.io/badge/platform-Windows%20only-0078D6)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 Brings your Windows Terminal tabs back after the terminal goes away: close-all, crash, force-kill, logoff, reboot or power loss.
 Windows only (Windows Terminal + Windows PowerShell 5.1 or PowerShell 7).
@@ -78,3 +79,8 @@ Want your own tool resumed properly? [Open a request](https://github.com/Mars-Wa
 `powershell -File tests\Run-Tests.ps1` runs the tests without touching your terminal. `tests\E2E.ps1` is a destructive
 end-to-end test and `tests\Bench-Guardian.ps1` measures the guardian. Pushing a `v<version>` tag that matches the manifest
 publishes to the PowerShell Gallery.
+
+## License
+
+[Apache-2.0](LICENSE). If you redistribute TerminalRess or build on it, keep the [NOTICE](NOTICE) file.
+If it saves you time, you can [sponsor its development](https://github.com/sponsors/Mars-Wave).
